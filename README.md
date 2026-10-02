@@ -76,7 +76,8 @@ This writes the files below to `samples/` (git-ignored) plus a matching `samples
 | `cfdp_incomplete.cadu` | CFDP with exact missing ranges         | `analyze --cfdp-apid 0x7E1 cfdp_incomplete.cadu` | `tui --cfdp-apid 0x7E1 cfdp_incomplete.cadu` |
 | `mixed.cadu`           | everything at once (best TUI demo)     | `analyze mixed.cadu`                             | `tui mixed.cadu`                             |
 
-In the TUI: `tab`/`1`-`6` switch panes (Frames, Packets, Inspector, CFDP, Stats, Events), `↑↓`/`jk` move, `enter` inspects a packet, `/` filters the table, `q` quits.
+In the TUI: `tab`/`1`-`7` switch panes (Frames, Packets, Inspector, CFDP, Stats, Events, Timeline), `↑↓`/`jk` move, `enter` inspects a packet, `/` filters the table, `q` quits.
+The Timeline lays every VC across the capture's packet time (or file offset without time), marking where frames arrived, were partly lost or missing entirely; `←→` move, `+`/`-` zoom, `enter` jumps to the events and `f` to the frames at the cursor.
 
 ## Develop
 

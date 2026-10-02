@@ -61,6 +61,7 @@ type FrameInfo struct {
 	FHP          uint16         `json:"fhp"`
 	HasFHP       bool           `json:"has_fhp"`
 	DataLen      int            `json:"data_len"`
+	Time         time.Time      `json:"time,omitzero"` // latest packet time once the frame is processed
 	Raw          []byte         `json:"-"`
 }
 
@@ -228,6 +229,9 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		}
 		for _, p := range pkts { // consumed before the next Route (reused arena)
 			record(p)
+		}
+		if opts.CollectFrames {
+			res.FrameList[len(res.FrameList)-1].Time = engine.Now()
 		}
 	}
 

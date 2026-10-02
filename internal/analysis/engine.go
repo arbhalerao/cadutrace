@@ -165,6 +165,9 @@ func (e *Engine) ObserveSuspect(tfvn ccsdsdefs.TFVN, scid ccsdsdefs.SCID, vcid c
 		Message: tfvn.String() + " " + subject(scid, vcid, 0, false) + " frame dropped as a likely false decode"})
 }
 
+// Now is the latest accepted packet time, zero before any
+func (e *Engine) Now() time.Time { return e.tl.now }
+
 func (e *Engine) publish(ev Event) {
 	ev.Time = e.tl.now
 	e.bus.Publish(ev)

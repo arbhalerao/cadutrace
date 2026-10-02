@@ -15,10 +15,11 @@ const (
 	viewCFDP
 	viewStats
 	viewEvents
+	viewTimeline
 	numViews
 )
 
-var viewNames = [numViews]string{"Frames", "Packets", "Inspector", "CFDP", "Stats", "Events"}
+var viewNames = [numViews]string{"Frames", "Packets", "Inspector", "CFDP", "Stats", "Events", "Timeline"}
 
 // Model is the root Bubble Tea model
 type Model struct {
@@ -34,6 +35,7 @@ type Model struct {
 
 	inspector inspectorView
 	stats     statsView
+	timeline  timelineView
 
 	filter  filterState
 	matches []int // active view's filtered store indices; nil = no filter
@@ -46,6 +48,7 @@ func New(s *store.Store) Model {
 	m.cfdp.setTotal(len(s.CFDP()))
 	m.events.setTotal(len(s.Events()))
 	m.inspector.packetIndex = -1
+	m.timeline.build(s)
 	return m
 }
 
@@ -61,6 +64,8 @@ func (m *Model) layout() {
 	m.events.setHeight(tableH)
 	m.stats.height = m.contentH
 	m.inspector.height = m.contentH
+	m.timeline.width, m.timeline.height = m.width, m.contentH
+	m.timeline.cursor = min(m.timeline.cursor, m.timeline.cols()-1)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -106,7 +111,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.active = (m.active + numViews - 1) % numViews
 		m.refilter()
 		return m, nil
-	case "1", "2", "3", "4", "5", "6":
+	case "1", "2", "3", "4", "5", "6", "7":
 		if v := viewID(k.String()[0] - '1'); v < numViews {
 			m.active = v
 			m.refilter()
@@ -133,8 +138,28 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.stats.handleKey(k.String())
 	case viewEvents:
 		m.events.handleKey(k.String())
+	case viewTimeline:
+		switch k.String() {
+		case "enter":
+			m.jumpTo(viewEvents, m.jumpEvents())
+		case "f":
+			m.jumpTo(viewFrames, m.jumpFrames())
+		default:
+			m.timeline.handleKey(k.String())
+		}
 	}
 	return m, nil
+}
+
+// jumpTo shows view v with its cursor on store row i, clearing any filter
+func (m *Model) jumpTo(v viewID, i int) {
+	m.active = v
+	m.filter.query = ""
+	m.refilter()
+	if t := m.activeTable(); t != nil {
+		t.cursor = i
+		t.clamp()
+	}
 }
 
 func (m Model) View() string {
@@ -155,6 +180,8 @@ func (m Model) View() string {
 		body = m.viewStats()
 	case viewEvents:
 		body = m.viewEvents()
+	case viewTimeline:
+		body = m.viewTimeline()
 	}
 	return m.renderTabs() + "\n" + body + "\n" + m.renderStatus()
 }
@@ -187,6 +214,8 @@ func (m Model) renderStatus() string {
 		info = "txn " + m.cfdp.scrollInfo()
 	case viewEvents:
 		info = "event " + m.events.scrollInfo()
+	case viewTimeline:
+		info = "[←→] move  [+/-] zoom  [enter] events here  [f] frames here"
 	}
 	if m.filter.active() {
 		info = warnStyle.Render("filter:"+m.filter.query) + "  " + info
