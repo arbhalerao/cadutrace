@@ -1,6 +1,9 @@
 package analysis
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/arbhalerao/cadutrace/internal/analysis/cfdptrack"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 )
@@ -9,6 +12,7 @@ import (
 // Content-derived numbers only; the wall-clock rate is printed separately by the CLI
 type Statistics struct {
 	Quality Quality      `json:"quality"`
+	Time    TimeStats    `json:"time"`
 	Frames  FrameStats   `json:"frames"`
 	Packets PacketStats  `json:"packets"`
 	APIDs   []APIDStats  `json:"apids"`
@@ -18,6 +22,69 @@ type Statistics struct {
 	Encapsulation []EncapStats                `json:"encapsulation,omitempty"`
 	CLCW          []CLCWStat                  `json:"clcw,omitempty"`
 	CFDP          []cfdptrack.TransactionStat `json:"cfdp,omitempty"`
+
+	Gaps   []Gap   `json:"gaps,omitempty"`
+	Bursts []Burst `json:"bursts,omitempty"`
+}
+
+// TimeStats describes the packet time found in the capture
+// Relative means no epoch was known, so times only order and space events
+type TimeStats struct {
+	Code            string    `json:"code,omitempty"`
+	Epoch           string    `json:"epoch,omitempty"`
+	Relative        bool      `json:"relative,omitempty"`
+	Start           time.Time `json:"start,omitzero"`
+	End             time.Time `json:"end,omitzero"`
+	DurationSeconds float64   `json:"duration_seconds"`
+	Packets         uint64    `json:"packets"`
+	Rejected        uint64    `json:"rejected"`
+}
+
+// Stamp renders t for reports: a date, or seconds from the start when relative
+func (ts TimeStats) Stamp(t time.Time) string {
+	switch {
+	case t.IsZero():
+		return "-"
+	case ts.Relative:
+		return fmt.Sprintf("+%.3fs", t.Sub(ts.Start).Seconds())
+	default:
+		return t.UTC().Format("2006-01-02 15:04:05.000")
+	}
+}
+
+// Gap is one loss: frames missing on a VC, or packets missing from an APID
+// Onboard marks packets missing although their VC lost no frames in between,
+// i.e. lost before the downlink. Start and End bound the loss in packet time
+type Gap struct {
+	Kind    string         `json:"kind"`
+	SCID    ccsdsdefs.SCID `json:"scid"`
+	VCID    ccsdsdefs.VCID `json:"vcid"`
+	APID    ccsdsdefs.APID `json:"apid"`
+	Missing uint64         `json:"missing"`
+	Onboard bool           `json:"onboard,omitempty"`
+	Start   time.Time      `json:"start,omitzero"`
+	End     time.Time      `json:"end,omitzero"`
+	Offset  int64          `json:"offset"`
+}
+
+// Burst is a span of time over which frames were lost, merged across VCs
+type Burst struct {
+	Start           time.Time  `json:"start"`
+	End             time.Time  `json:"end"`
+	DurationSeconds float64    `json:"duration_seconds"`
+	Frames          []VCLoss   `json:"frames"`
+	Packets         []APIDLoss `json:"packets,omitempty"`
+}
+
+type VCLoss struct {
+	SCID   ccsdsdefs.SCID `json:"scid"`
+	VCID   ccsdsdefs.VCID `json:"vcid"`
+	Frames uint64         `json:"frames"`
+}
+
+type APIDLoss struct {
+	APID    ccsdsdefs.APID `json:"apid"`
+	Missing uint64         `json:"missing"`
 }
 
 // Quality summarizes how much of the capture could be trusted
@@ -100,6 +167,8 @@ type APIDStats struct {
 	MissingPackets uint64           `json:"missing_packets"`
 	Duplicates     uint64           `json:"duplicates"`
 	Reorders       uint64           `json:"reorders"`
+	OnboardGaps    uint64           `json:"onboard_gaps"`
+	OnboardMissing uint64           `json:"onboard_missing"`
 	LastSeqCount   uint16           `json:"last_seq_count"`
 }
 

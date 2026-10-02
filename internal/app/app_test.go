@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	"github.com/arbhalerao/cadutrace/internal/app"
+	"github.com/arbhalerao/cadutrace/internal/decode/timecode"
 	"github.com/arbhalerao/cadutrace/internal/detect"
 	"github.com/arbhalerao/cadutrace/internal/testgen"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
@@ -142,5 +144,78 @@ func TestBareFrames(t *testing.T) {
 	}
 	if got := res.Statistics.Packets.Total - res.Statistics.Packets.Idle; int(got) != man.TotalPackets {
 		t.Fatalf("decoded %d packets, want %d", got, man.TotalPackets)
+	}
+}
+
+func timedConfig(skip int) testgen.StreamConfig {
+	tf, _ := timecode.Parse("cuc4.2@7")
+	start := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+	return config(120, func(c *testgen.StreamConfig) {
+		for i := range c.VCs {
+			c.VCs[i].Time = &testgen.TimeConfig{Format: tf, Epoch: timecode.EpochCCSDS, Start: start, Step: 251300 * time.Microsecond}
+			c.VCs[i].SkipSeqEvery = skip
+		}
+	})
+}
+
+func TestPacketTimeIsDetected(t *testing.T) {
+	data, man, err := testgen.Build(timedConfig(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := run(t, data)
+	ts := res.Statistics.Time
+	start := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+	// the octet after the time code varies here, so it may be read as a third
+	// fraction octet; that changes times by well under a microsecond
+	if (ts.Code != "cuc4.2@7" && ts.Code != "cuc4.3@7") || ts.Epoch != "1958-01-01" || ts.Relative {
+		t.Fatalf("time %+v", ts)
+	}
+	perVC := man.TotalPackets / 3
+	wantEnd := start.Add(time.Duration(perVC-1) * 251300 * time.Microsecond)
+	if ts.Start.Sub(start).Abs() > time.Millisecond || ts.End.Sub(wantEnd).Abs() > time.Millisecond {
+		t.Fatalf("span %v .. %v, want %v .. %v", ts.Start, ts.End, start, wantEnd)
+	}
+	for _, p := range res.PacketList {
+		if !p.Idle && p.Time.IsZero() {
+			t.Fatalf("packet without time: %+v", p)
+		}
+	}
+}
+
+func TestLossIsPlacedInTime(t *testing.T) {
+	var buf bytes.Buffer
+	if err := testgen.WriteStream(&buf, timedConfig(0), 1_000_000, 37); err != nil {
+		t.Fatal(err)
+	}
+	st := run(t, buf.Bytes()).Statistics
+	if len(st.Bursts) == 0 {
+		t.Fatal("no loss bursts")
+	}
+	for _, g := range st.Gaps {
+		if g.Kind == "frames" && (g.Start.IsZero() || g.End.IsZero() || g.End.Before(g.Start)) {
+			t.Fatalf("frame gap not bounded in time: %+v", g)
+		}
+		if g.Onboard {
+			t.Fatalf("downlink loss classified as onboard: %+v", g)
+		}
+	}
+}
+
+func TestOnboardLossIsClassified(t *testing.T) {
+	data, _, err := testgen.Build(timedConfig(50))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := run(t, data).Statistics
+	var onboard uint64
+	for _, a := range st.APIDs {
+		onboard += a.OnboardGaps
+	}
+	if onboard == 0 || onboard != st.Packets.SequenceGaps {
+		t.Fatalf("onboard gaps %d, sequence gaps %d", onboard, st.Packets.SequenceGaps)
+	}
+	if len(st.Bursts) != 0 {
+		t.Fatalf("unexpected loss bursts %+v", st.Bursts)
 	}
 }

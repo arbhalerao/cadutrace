@@ -54,11 +54,12 @@ func (p *packer) field() (field []byte, fhp uint16) {
 
 // vcGen produces an endless cycle of packets for one virtual channel
 type vcGen struct {
-	cfg  VCConfig
-	pk   packer
-	vcfc uint32
-	i    int
-	seq  map[ccsdsdefs.APID]uint16
+	cfg   VCConfig
+	pk    packer
+	vcfc  uint32
+	i     int
+	seq   map[ccsdsdefs.APID]uint16
+	count map[ccsdsdefs.APID]int
 }
 
 func (g *vcGen) nextPacket() []byte {
@@ -70,8 +71,9 @@ func (g *vcGen) nextPacket() []byte {
 	}
 	apid := g.cfg.APIDs[i%len(g.cfg.APIDs)]
 	s := g.seq[apid]
-	g.seq[apid]++
-	return spacePacket(apid, s, g.cfg.PacketLen, byte(i))
+	g.count[apid]++
+	g.seq[apid] = g.cfg.nextSeq(s, g.count[apid])
+	return g.cfg.packet(apid, s, byte(i), i)
 }
 
 // WriteStream writes interleaved CADUs for cfg to w until targetBytes, with
@@ -105,7 +107,7 @@ func WriteStream(w io.Writer, cfg StreamConfig, targetBytes int64, dropEveryN in
 		if vc.PacketLen < minLen {
 			return fmt.Errorf("testgen: PacketLen must be >= %d, got %d", minLen, vc.PacketLen)
 		}
-		gens = append(gens, &vcGen{cfg: vc, pk: packer{dataLen: cfg.FrameDataLen}, seq: map[ccsdsdefs.APID]uint16{}})
+		gens = append(gens, &vcGen{cfg: vc, pk: packer{dataLen: cfg.FrameDataLen}, seq: map[ccsdsdefs.APID]uint16{}, count: map[ccsdsdefs.APID]int{}})
 	}
 
 	bw := bufio.NewWriterSize(w, 1<<20)

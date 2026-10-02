@@ -18,6 +18,7 @@ type VirtualChannel struct {
 	HasLast          bool
 	FrameGaps        uint64 // discontinuities observed
 	FramesLost       uint64 // inferred missing frames
+	LastLost         uint64 // frames found missing just before the latest frame
 
 	Reasm ReassemblyState
 }

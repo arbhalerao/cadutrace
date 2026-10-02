@@ -21,6 +21,8 @@ make build
 Settings are detected from the capture: sync marker or bare frames, frame length, randomization, FECF and Reed-Solomon length (the last only when frames carry an FECF).
 Any flag you pass is used as given, and the report shows what was detected.
 Frames that fail their FECF, or whose channel looks like a one-off false decode, are dropped and counted in the Quality section.
+Packet time is read from the packet secondary header: the CCSDS CUC or CDS time code, its position and its epoch are detected, or set with `--time` and `--epoch`.
+With time, the report places every frame loss in a time span, merges simultaneous losses across VCs into bursts, and separates packets missing while their VC lost no frames (likely lost before downlink).
 
 Flags (✓ = available for that command):
 
@@ -42,6 +44,8 @@ Flags (✓ = available for that command):
 | `--aos-ocf`         |    ✓    |   ✓   | off      | AOS frames carry an Operational Control Field                 |
 | `--aos-fecf`        |    ✓    |   ✓   | detected | AOS frames carry a Frame Error Control Field                  |
 | `--aos-insert-zone` |    ✓    |   ✓   | 0        | AOS insert zone length in octets                              |
+| `--time`            |    ✓    |   ✓   | detected | packet time code, e.g. `cuc4.2@7` (octet offset in the secondary header), `cds2.0+p`, or `off` |
+| `--epoch`           |    ✓    |   ✓   | detected | time code epoch: `ccsds` (1958), `2000`, `gps`, `unix`, or a date |
 | `--cfdp-apid`       |    ✓    |   ✓   | -        | comma-separated APIDs carrying CFDP to decode and track       |
 | `--apid`            |    ✓    |       | -        | restrict the `--packets` list to these APIDs (csv, dec or 0x) |
 | `--vcid`            |    ✓    |       | -        | restrict the `--packets` list to these VCIDs (csv)            |

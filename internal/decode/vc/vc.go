@@ -48,12 +48,14 @@ func (m *Manager) Route(f decode.TransferFrame) (*model.VirtualChannel, []*model
 
 	cnt, mod := f.VCCount(), f.VCCountModulus()
 	lost := false
+	vc.LastLost = 0
 	if vc.HasLast {
 		expected := (vc.LastVCFrameCount + 1) % mod
 		missing := int64(cnt) - int64(expected)
 		missing = (missing%int64(mod) + int64(mod)) % int64(mod)
 		if missing != 0 {
 			lost = true
+			vc.LastLost = uint64(missing)
 			vc.FrameGaps++
 			vc.FramesLost += uint64(missing)
 		}

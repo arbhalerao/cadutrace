@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/arbhalerao/cadutrace/internal/analysis"
 	"github.com/arbhalerao/cadutrace/internal/appdecoder"
@@ -35,6 +36,7 @@ type Options struct {
 	Detect *detect.Fixed
 	// KeepSuspect keeps frames from channels that look like false decodes
 	KeepSuspect bool
+	Time        TimeOptions
 }
 
 // Settings records the frame settings a run used
@@ -80,6 +82,7 @@ type PacketInfo struct {
 	Length    int                  `json:"length"`
 	Idle      bool                 `json:"idle"`
 	Truncated bool                 `json:"truncated"`
+	Time      time.Time            `json:"time,omitzero"`
 	Kind      string               `json:"kind,omitempty"`     // "encap" for Encapsulation Packets
 	Protocol  string               `json:"protocol,omitempty"` // encap Protocol ID name
 	Raw       []byte               `json:"-"`                  // full packet bytes for the hex view
@@ -96,7 +99,7 @@ func packetInfo(p *model.SpacePacket) PacketInfo {
 	return PacketInfo{
 		SCID: p.SCID, VCID: p.VCID, APID: p.APID, Type: p.Type,
 		SeqFlags: p.SeqFlags, SeqCount: p.SeqCount, Length: p.TotalLen(),
-		Idle: p.IsIdle(), Truncated: p.Truncated, Raw: p.Raw,
+		Idle: p.IsIdle(), Truncated: p.Truncated, Raw: p.Raw, Time: p.Time,
 	}
 }
 
@@ -144,6 +147,11 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			return nil, err
 		}
 	}
+	td, timeNotes, err := setupTime(data, opts, trusted)
+	if err != nil {
+		return nil, err
+	}
+	notes = append(notes, timeNotes...)
 	dec := decode.NewFrameDecoder(opts.Frames)
 	mgr := vc.New(opts.MaxPacketLen)
 	engine := analysis.NewEngine(analysis.Config{
@@ -167,6 +175,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	record := func(p *model.SpacePacket) {
+		td.stamp(p)
 		engine.ObservePacket(p)
 		if opts.CollectPackets {
 			res.PacketList = append(res.PacketList, packetInfo(p))
@@ -200,7 +209,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			engine.ObserveDecodeError(raw.Offset)
 			continue
 		}
-		engine.ObserveFrame(f, caduLen)
+		engine.ObserveFrame(f, caduLen, raw.Offset)
 		if opts.CollectFrames {
 			fhp, ok := f.FirstHeaderPointer()
 			res.FrameList = append(res.FrameList, FrameInfo{
@@ -210,9 +219,12 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 				DataLen: len(f.Data()), Raw: raw.Data,
 			})
 		}
-		_, pkts, rerr := mgr.Route(f)
+		ch, pkts, rerr := mgr.Route(f)
 		if rerr != nil {
 			return nil, rerr
+		}
+		if ch.LastLost > 0 {
+			engine.ObserveFrameGap(ch.SCID, ch.VCID, ch.LastLost)
 		}
 		for _, p := range pkts { // consumed before the next Route (reused arena)
 			record(p)
@@ -225,6 +237,9 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	res.Statistics = engine.Snapshot(mgr.VirtualChannels())
+	ts := &res.Statistics.Time
+	ts.Code, ts.Epoch = td.describe()
+	ts.Relative = td != nil && td.relative
 	return res, nil
 }
 

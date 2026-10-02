@@ -27,6 +27,7 @@ type LoadOptions struct {
 	CFDPAPIDs    []ccsdsdefs.APID
 	Detect       *detect.Fixed
 	KeepSuspect  bool
+	Time         app.TimeOptions
 }
 
 // Store holds an analyzed capture for random-access navigation
@@ -68,6 +69,7 @@ func Load(ctx context.Context, opts LoadOptions) (*Store, error) {
 		Bus:            bus,
 		Detect:         opts.Detect,
 		KeepSuspect:    opts.KeepSuspect,
+		Time:           opts.Time,
 	})
 	if err != nil {
 		return nil, err

@@ -48,6 +48,11 @@ func (m Model) viewStats() string {
 		add("  detected %s", n)
 	}
 
+	if ts := st.Time; ts.Code != "" && !ts.Start.IsZero() {
+		add("%s", titleStyle.Render("Time"))
+		add("  code %s  epoch %s  start %s  end %s  (%.0fs)", ts.Code, ts.Epoch, ts.Stamp(ts.Start), ts.Stamp(ts.End), ts.DurationSeconds)
+	}
+
 	add("%s", titleStyle.Render("Frames"))
 	add("  total %d  tm %d  aos %d  idle %d  decode-errors %d  bytes %d",
 		st.Frames.Total, st.Frames.TM, st.Frames.AOS, st.Frames.Idle, st.Frames.DecodeErrors, st.Frames.Bytes)

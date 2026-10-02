@@ -1,6 +1,10 @@
 package model
 
-import "github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
+import (
+	"time"
+
+	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
+)
 
 // PacketKind distinguishes the packet types that share a frame data field
 type PacketKind uint8
@@ -31,6 +35,8 @@ type SpacePacket struct {
 
 	SCID ccsdsdefs.SCID `json:"scid"`
 	VCID ccsdsdefs.VCID `json:"vcid"`
+
+	Time time.Time `json:"-"` // from the secondary header time code, zero if none
 }
 
 func (p *SpacePacket) IsIdle() bool { return p.Kind == KindSpace && p.APID.IsIdle() }

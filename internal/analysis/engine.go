@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/arbhalerao/cadutrace/internal/analysis/cfdptrack"
 	"github.com/arbhalerao/cadutrace/internal/analysis/gap"
@@ -50,7 +51,8 @@ type Engine struct {
 	encapPackets, encapBytes uint64 // Encapsulation Packets, tracked apart from Space Packets
 
 	apids  map[ccsdsdefs.APID]*apidAccum
-	seqs   map[seqKey]*gap.Tracker
+	seqs   map[seqKey]*seqState
+	tl     timeline
 	encap  map[uint8]*encapAccum
 	seenVC map[vcKey]bool
 	clcw   map[vcKey]*clcwAccum
@@ -71,6 +73,12 @@ type vcKey struct {
 type seqKey struct {
 	vc   vcKey
 	apid ccsdsdefs.APID
+}
+
+type seqState struct {
+	tr        *gap.Tracker
+	last      time.Time
+	lossEpoch uint64
 }
 
 type suspectAccum struct {
@@ -95,6 +103,8 @@ type apidAccum struct {
 	vcs               map[ccsdsdefs.VCID]bool
 	seqGaps, missing  uint64
 	duplicates, reord uint64
+	onboardGaps       uint64
+	onboardMissing    uint64
 	lastSeq           uint16
 }
 
@@ -105,7 +115,8 @@ func NewEngine(cfg Config) *Engine {
 		bus:     cfg.Bus,
 		window:  cfg.SeqWindow,
 		apids:   make(map[ccsdsdefs.APID]*apidAccum),
-		seqs:    make(map[seqKey]*gap.Tracker),
+		seqs:    make(map[seqKey]*seqState),
+		tl:      newTimeline(),
 		encap:   make(map[uint8]*encapAccum),
 		seenVC:  make(map[vcKey]bool),
 		suspect: make(map[vcKey]*suspectAccum),
@@ -131,14 +142,14 @@ func NewEngine(cfg Config) *Engine {
 // ObserveDecodeError records a frame that failed to decode
 func (e *Engine) ObserveDecodeError(offset int64) {
 	e.decodeErrors++
-	e.bus.Publish(Event{Type: EvDecodeError, Message: "frame decode failed"})
+	e.publish(Event{Type: EvDecodeError, Message: "frame decode failed"})
 	e.log.Debug("frame decode error", "offset", offset)
 }
 
 // ObserveCRCFailure records a frame dropped because its FECF did not match
 func (e *Engine) ObserveCRCFailure(offset int64) {
 	e.crcFailures++
-	e.bus.Publish(Event{Type: EvCRCFailure, Message: "frame failed CRC at offset " + strconv.FormatInt(offset, 10)})
+	e.publish(Event{Type: EvCRCFailure, Message: "frame failed CRC at offset " + strconv.FormatInt(offset, 10)})
 }
 
 // ObserveSuspect records a frame dropped because its channel looks like a false decode
@@ -150,13 +161,26 @@ func (e *Engine) ObserveSuspect(tfvn ccsdsdefs.TFVN, scid ccsdsdefs.SCID, vcid c
 		e.suspect[k] = a
 	}
 	a.frames++
-	e.bus.Publish(Event{Type: EvSuspectFrame, SCID: scid, VCID: vcid,
+	e.publish(Event{Type: EvSuspectFrame, SCID: scid, VCID: vcid,
 		Message: tfvn.String() + " " + subject(scid, vcid, 0, false) + " frame dropped as a likely false decode"})
 }
 
-// ObserveFrame records a decoded transfer frame; caduLen is the CADU stride for
-// byte accounting
-func (e *Engine) ObserveFrame(f decode.TransferFrame, caduLen int) {
+func (e *Engine) publish(ev Event) {
+	ev.Time = e.tl.now
+	e.bus.Publish(ev)
+}
+
+// ObserveFrameGap records frames missing on a VC just before the current frame
+func (e *Engine) ObserveFrameGap(scid ccsdsdefs.SCID, vcid ccsdsdefs.VCID, lost uint64) {
+	e.tl.frameGap(vcKey{scid, vcid}, lost)
+	e.publish(Event{Type: EvFrameGap, SCID: scid, VCID: vcid,
+		Message: subject(scid, vcid, 0, false) + " lost " + strconv.FormatUint(lost, 10) + " frame(s)"})
+}
+
+// ObserveFrame records a decoded transfer frame at a byte offset; caduLen is the
+// CADU stride for byte accounting
+func (e *Engine) ObserveFrame(f decode.TransferFrame, caduLen int, offset int64) {
+	e.tl.offset = offset
 	e.frames++
 	e.caduBytes += uint64(caduLen)
 
@@ -165,7 +189,7 @@ func (e *Engine) ObserveFrame(f decode.TransferFrame, caduLen int) {
 	k := vcKey{scid, vcid}
 	if !e.seenVC[k] {
 		e.seenVC[k] = true
-		e.bus.Publish(Event{Type: EvNewVC, SCID: scid, VCID: vcid,
+		e.publish(Event{Type: EvNewVC, SCID: scid, VCID: vcid,
 			Message: subject(scid, vcid, 0, false) + " first seen"})
 	}
 
@@ -202,6 +226,9 @@ func (e *Engine) ObservePacket(p *model.SpacePacket) {
 		return
 	}
 
+	k := vcKey{p.SCID, p.VCID}
+	p.Time = e.tl.observe(k, p.Time)
+
 	e.packets++
 	total := p.TotalLen()
 	e.packetBytes += uint64(total)
@@ -224,12 +251,12 @@ func (e *Engine) ObservePacket(p *model.SpacePacket) {
 	}
 	if p.Truncated {
 		e.truncated++
-		e.bus.Publish(Event{Type: EvTruncated, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
+		e.publish(Event{Type: EvTruncated, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
 			Message: subject(p.SCID, p.VCID, p.APID, true) + " truncated during reassembly"})
 	}
 	if p.Version != 0 {
 		e.malformed++
-		e.bus.Publish(Event{Type: EvMalformed, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
+		e.publish(Event{Type: EvMalformed, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
 			Message: subject(p.SCID, p.VCID, p.APID, true) + " malformed packet version"})
 	}
 
@@ -237,32 +264,48 @@ func (e *Engine) ObservePacket(p *model.SpacePacket) {
 	if p.IsIdle() {
 		return
 	}
-	sk := seqKey{vcKey{p.SCID, p.VCID}, p.APID}
-	tr := e.seqs[sk]
-	if tr == nil {
-		tr = gap.New(packetSeqModulus, e.window)
-		e.seqs[sk] = tr
+	sk := seqKey{k, p.APID}
+	st := e.seqs[sk]
+	if st == nil {
+		st = &seqState{tr: gap.New(packetSeqModulus, e.window), lossEpoch: e.tl.lossEpoch[k]}
+		e.seqs[sk] = st
 	}
-	out, miss := tr.Observe(int(p.SeqCount))
+	out, miss := st.tr.Observe(int(p.SeqCount))
 	switch out {
 	case gap.Gap:
 		a.seqGaps++
 		a.missing += uint64(miss)
 		e.seqGaps++
 		e.missing += uint64(miss)
-		e.bus.Publish(Event{Type: EvPacketGap, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
-			Message: subject(p.SCID, p.VCID, p.APID, true) + " sequence gap"})
+		onboard := st.lossEpoch == e.tl.lossEpoch[k]
+		if onboard {
+			a.onboardGaps++
+			a.onboardMissing += uint64(miss)
+		}
+		e.tl.packetGap(k, p.APID, uint64(miss), st.last, p.Time, onboard)
+		msg := subject(p.SCID, p.VCID, p.APID, true) + " missing " + strconv.Itoa(miss) + " packet(s)"
+		if onboard {
+			msg += " with no frame loss on its VC (lost before downlink)"
+		}
+		e.publish(Event{Type: EvPacketGap, SCID: p.SCID, VCID: p.VCID, APID: p.APID, Message: msg})
 		e.log.Debug("packet sequence gap", "apid", uint16(p.APID), "missing", miss, "seq", p.SeqCount)
 	case gap.Duplicate:
 		a.duplicates++
 		e.duplicates++
-		e.bus.Publish(Event{Type: EvPacketDuplicate, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
+		e.publish(Event{Type: EvPacketDuplicate, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
 			Message: subject(p.SCID, p.VCID, p.APID, true) + " duplicate packet"})
 	case gap.Reorder:
 		a.reord++
 		e.reorders++
-		e.bus.Publish(Event{Type: EvPacketReorder, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
+		e.publish(Event{Type: EvPacketReorder, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
 			Message: subject(p.SCID, p.VCID, p.APID, true) + " reordered packet"})
+	}
+	if !p.Time.IsZero() {
+		st.last = p.Time
+	}
+	st.lossEpoch = e.tl.lossEpoch[k]
+	if p.Truncated {
+		st.lossEpoch = ^uint64(0) // loss follows a truncated packet, so its next gap is not on board
 	}
 
 	if e.registry != nil && e.registry.Handles(p.APID) {
@@ -285,7 +328,7 @@ func (e *Engine) observeEncap(p *model.SpacePacket) {
 	a.bytes += uint64(n)
 	if p.Truncated {
 		e.truncated++
-		e.bus.Publish(Event{Type: EvTruncated, SCID: p.SCID, VCID: p.VCID,
+		e.publish(Event{Type: EvTruncated, SCID: p.SCID, VCID: p.VCID,
 			Message: subject(p.SCID, p.VCID, 0, false) + " encapsulation packet truncated during reassembly"})
 	}
 }
@@ -311,17 +354,17 @@ func (e *Engine) handleCFDPNotice(n cfdptrack.Notice) {
 	}
 	switch n.Kind {
 	case cfdptrack.NoticeStarted:
-		e.bus.Publish(Event{Type: EvCFDPStarted, Message: txnMsg("started")})
+		e.publish(Event{Type: EvCFDPStarted, Message: txnMsg("started")})
 	case cfdptrack.NoticeEOF:
-		e.bus.Publish(Event{Type: EvCFDPEOF, Message: txnMsg("EOF received")})
+		e.publish(Event{Type: EvCFDPEOF, Message: txnMsg("EOF received")})
 	case cfdptrack.NoticeGap:
-		e.bus.Publish(Event{Type: EvCFDPGap, Message: txnMsg("file gap at offset " + strconv.FormatUint(n.Offset, 10))})
+		e.publish(Event{Type: EvCFDPGap, Message: txnMsg("file gap at offset " + strconv.FormatUint(n.Offset, 10))})
 	case cfdptrack.NoticeNAK:
-		e.bus.Publish(Event{Type: EvCFDPNAK, Message: txnMsg("NAK")})
+		e.publish(Event{Type: EvCFDPNAK, Message: txnMsg("NAK")})
 	case cfdptrack.NoticeComplete:
-		e.bus.Publish(Event{Type: EvCFDPComplete, Message: txnMsg("complete")})
+		e.publish(Event{Type: EvCFDPComplete, Message: txnMsg("complete")})
 	case cfdptrack.NoticeIncomplete:
-		e.bus.Publish(Event{Type: EvCFDPIncomplete, Message: txnMsg("incomplete")})
+		e.publish(Event{Type: EvCFDPIncomplete, Message: txnMsg("incomplete")})
 	}
 }
 
@@ -331,7 +374,7 @@ func (e *Engine) apidFor(apid ccsdsdefs.APID) *apidAccum {
 	}
 	a := &apidAccum{apid: apid, vcs: make(map[ccsdsdefs.VCID]bool)}
 	e.apids[apid] = a
-	e.bus.Publish(Event{Type: EvNewAPID, APID: apid,
+	e.publish(Event{Type: EvNewAPID, APID: apid,
 		Message: subject(0, 0, apid, true) + " first seen"})
 	return a
 }
@@ -352,6 +395,9 @@ func (e *Engine) Snapshot(vcs []*model.VirtualChannel) Statistics {
 	}
 
 	s.Quality = e.quality(s)
+	s.Time = e.tl.stats()
+	s.Gaps = append([]Gap(nil), e.tl.gaps...)
+	s.Bursts = bursts(s.Gaps)
 
 	for id, a := range e.encap {
 		s.Encapsulation = append(s.Encapsulation, EncapStats{
@@ -378,6 +424,7 @@ func (e *Engine) Snapshot(vcs []*model.VirtualChannel) Statistics {
 			MinLength: a.minLen, MaxLength: a.maxLen, MeanLength: mean,
 			SequenceGaps: a.seqGaps, MissingPackets: a.missing,
 			Duplicates: a.duplicates, Reorders: a.reord, LastSeqCount: a.lastSeq,
+			OnboardGaps: a.onboardGaps, OnboardMissing: a.onboardMissing,
 		})
 	}
 	sort.Slice(s.APIDs, func(i, j int) bool { return s.APIDs[i].APID < s.APIDs[j].APID })

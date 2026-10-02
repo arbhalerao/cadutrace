@@ -4,10 +4,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/arbhalerao/cadutrace/internal/decode/encap"
 	"github.com/arbhalerao/cadutrace/internal/decode/fecf"
 	"github.com/arbhalerao/cadutrace/internal/decode/randomizer"
+	"github.com/arbhalerao/cadutrace/internal/decode/timecode"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 )
 
@@ -27,6 +29,21 @@ type VCConfig struct {
 	// APIDs is then ignored and PacketLen must be >= 2
 	Encap          bool
 	EncapProtocols []uint8
+
+	// Time, when set, gives every Space Packet a secondary header carrying a time code
+	Time *TimeConfig
+	// SkipSeqEvery > 0 skips one sequence count after every that many packets of an
+	// APID, as if packets were lost on board before reaching the downlink
+	SkipSeqEvery int
+}
+
+// TimeConfig stamps packet i of a VC with Start + i*Step, written in Format after
+// Format.Offset octets of other secondary header fields
+type TimeConfig struct {
+	Format timecode.Format
+	Epoch  time.Time
+	Start  time.Time
+	Step   time.Duration
 }
 
 // StreamConfig describes a whole capture
@@ -119,8 +136,8 @@ func Build(cfg StreamConfig) ([]byte, Manifest, error) {
 				continue
 			}
 			apid := vc.APIDs[i%len(vc.APIDs)]
-			buf = append(buf, spacePacket(apid, seqByAPID[apid], vc.PacketLen, byte(i))...)
-			seqByAPID[apid]++
+			buf = append(buf, vc.packet(apid, seqByAPID[apid], byte(i), i)...)
+			seqByAPID[apid] = vc.nextSeq(seqByAPID[apid], man.PacketsPerAPID[apid]+1)
 			man.PacketsPerAPID[apid]++
 			man.TotalPackets++
 		}
@@ -197,6 +214,26 @@ func frameTotalLen(t ccsdsdefs.TFVN, dataLen int) int {
 // payload pattern
 func SpacePacketBytes(apid ccsdsdefs.APID, seq uint16, total int, fill byte) []byte {
 	return spacePacket(apid, seq, total, fill)
+}
+
+func (vc VCConfig) packet(apid ccsdsdefs.APID, seq uint16, fill byte, i int) []byte {
+	p := spacePacket(apid, seq, vc.PacketLen, fill)
+	if tc := vc.Time; tc != nil {
+		p[0] |= 0x08
+		for j := range tc.Format.Offset {
+			p[6+j] = byte(i + j)
+		}
+		copy(p[6+tc.Format.Offset:], tc.Format.Encode(tc.Start.Add(time.Duration(i)*tc.Step).Sub(tc.Epoch)))
+	}
+	return p
+}
+
+// nextSeq advances an APID's sequence count after its n-th packet
+func (vc VCConfig) nextSeq(seq uint16, n int) uint16 {
+	if vc.SkipSeqEvery > 0 && n%vc.SkipSeqEvery == 0 {
+		seq++
+	}
+	return seq + 1
 }
 
 func spacePacket(apid ccsdsdefs.APID, seq uint16, total int, fill byte) []byte {

@@ -1,20 +1,24 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/arbhalerao/cadutrace/internal/analysis"
 	"github.com/arbhalerao/cadutrace/internal/app"
 	"github.com/arbhalerao/cadutrace/internal/appdecoder"
 	"github.com/arbhalerao/cadutrace/internal/appdecoder/cfdp"
 	"github.com/arbhalerao/cadutrace/internal/decode"
 	"github.com/arbhalerao/cadutrace/internal/decode/aosframe"
+	"github.com/arbhalerao/cadutrace/internal/decode/timecode"
 	"github.com/arbhalerao/cadutrace/internal/decode/tmframe"
 	"github.com/arbhalerao/cadutrace/internal/detect"
 	"github.com/arbhalerao/cadutrace/internal/framing"
@@ -79,6 +83,8 @@ type frameFlags struct {
 	cfdpAPIDs   *string
 	noDetect    *bool
 	keepSuspect *bool
+	timeCode    *string
+	epoch       *string
 }
 
 func addFrameFlags(fs *flag.FlagSet) *frameFlags {
@@ -99,6 +105,8 @@ func addFrameFlags(fs *flag.FlagSet) *frameFlags {
 		cfdpAPIDs:   fs.String("cfdp-apid", "", "comma-separated APIDs carrying CFDP (e.g. 0x7E1,2017) to decode and track"),
 		noDetect:    fs.Bool("no-detect", false, "use only the given settings; skip auto-detection"),
 		keepSuspect: fs.Bool("keep-suspect", false, "keep frames from channels that look like false decodes"),
+		timeCode:    fs.String("time", "", "packet time code in the secondary header, e.g. cuc4.2@7 or cds2.0, or off (default: detected)"),
+		epoch:       fs.String("epoch", "", "time code epoch: ccsds (1958), 2000, gps, unix, or a date (default: detected)"),
 	}
 }
 
@@ -143,6 +151,29 @@ func (ff *frameFlags) settings() (framing.Config, decode.Config, *detect.Fixed, 
 	}, nil
 }
 
+func (ff *frameFlags) timeOptions() (app.TimeOptions, error) {
+	var to app.TimeOptions
+	switch *ff.timeCode {
+	case "":
+	case "off":
+		to.Off = true
+	default:
+		f, err := timecode.Parse(*ff.timeCode)
+		if err != nil {
+			return to, err
+		}
+		to.Format = &f
+	}
+	if *ff.epoch != "" {
+		e, err := timecode.ParseEpoch(*ff.epoch)
+		if err != nil {
+			return to, err
+		}
+		to.Epoch = &e
+	}
+	return to, nil
+}
+
 func (ff *frameFlags) cfdp() ([]ccsdsdefs.APID, error) {
 	if *ff.cfdpAPIDs == "" {
 		return nil, nil
@@ -172,6 +203,10 @@ func runTUI(args []string) error {
 	if err != nil {
 		return err
 	}
+	to, err := ff.timeOptions()
+	if err != nil {
+		return err
+	}
 
 	src, err := source.OpenFile(fs.Arg(0))
 	if err != nil {
@@ -188,6 +223,7 @@ func runTUI(args []string) error {
 		CFDPAPIDs:    apids,
 		Detect:       fixed,
 		KeepSuspect:  *ff.keepSuspect,
+		Time:         to,
 	})
 	if err != nil {
 		return err
@@ -218,6 +254,10 @@ func runAnalyze(args []string) error {
 		return fmt.Errorf("expected exactly one input file")
 	}
 	fc, dc, fixed, err := ff.settings()
+	if err != nil {
+		return err
+	}
+	to, err := ff.timeOptions()
 	if err != nil {
 		return err
 	}
@@ -252,6 +292,7 @@ func runAnalyze(args []string) error {
 		Registry:       registry,
 		Detect:         fixed,
 		KeepSuspect:    *ff.keepSuspect,
+		Time:           to,
 	}
 
 	start := time.Now()
@@ -381,6 +422,8 @@ func printReport(r *app.Result, elapsed time.Duration) {
 	}
 	fmt.Println()
 
+	printTime(st)
+
 	fmt.Println("Frames:")
 	fmt.Printf("  total %d  tm %d  aos %d  idle %d  decode-errors %d  bytes %d\n\n",
 		st.Frames.Total, st.Frames.TM, st.Frames.AOS, st.Frames.Idle, st.Frames.DecodeErrors, st.Frames.Bytes)
@@ -446,10 +489,83 @@ func printReport(r *app.Result, elapsed time.Duration) {
 		}
 	}
 
+	printLoss(st)
+
 	if len(st.Events) > 0 {
 		fmt.Println("\nEvents:")
 		for _, e := range st.Events {
 			fmt.Printf("  %-20s %-5s %d\n", e.Type, e.Severity, e.Count)
+		}
+	}
+}
+
+const maxBursts = 20
+
+func printTime(st analysis.Statistics) {
+	ts := st.Time
+	if ts.Code == "" {
+		return
+	}
+	fmt.Println("Time:")
+	epoch := ts.Epoch
+	if ts.Relative {
+		epoch = "unknown (relative times)"
+	}
+	fmt.Printf("  code %s  epoch %s  packets %d  rejected %d\n", ts.Code, epoch, ts.Packets, ts.Rejected)
+	if !ts.Start.IsZero() {
+		fmt.Printf("  start %s  end %s  duration %s\n", ts.Stamp(ts.Start), ts.Stamp(ts.End),
+			time.Duration(ts.DurationSeconds*float64(time.Second)).Round(time.Millisecond))
+	}
+	fmt.Println()
+}
+
+func printLoss(st analysis.Statistics) {
+	ts := st.Time
+	if len(st.Bursts) > 0 {
+		lost := func(b analysis.Burst) (n uint64) {
+			for _, f := range b.Frames {
+				n += f.Frames
+			}
+			return n
+		}
+		var frames uint64
+		for _, b := range st.Bursts {
+			frames += lost(b)
+		}
+		shown := st.Bursts
+		title := fmt.Sprintf("\nLoss bursts: %d (%d frames)", len(st.Bursts), frames)
+		if len(shown) > maxBursts {
+			shown = slices.Clone(shown)
+			slices.SortStableFunc(shown, func(a, b analysis.Burst) int { return cmp.Compare(lost(b), lost(a)) })
+			shown = shown[:maxBursts]
+			slices.SortStableFunc(shown, func(a, b analysis.Burst) int { return a.Start.Compare(b.Start) })
+			title += fmt.Sprintf(", largest %d shown (all in --json)", maxBursts)
+		}
+		fmt.Println(title)
+		fmt.Printf("  %-23s %9s  %-26s %s\n", "START", "DURATION", "FRAMES LOST", "PACKETS MISSING")
+		for _, b := range shown {
+			var fr, pk []string
+			for _, f := range b.Frames {
+				fr = append(fr, fmt.Sprintf("VC%d:%d", f.VCID, f.Frames))
+			}
+			for _, p := range b.Packets {
+				pk = append(pk, fmt.Sprintf("0x%03X:%d", uint16(p.APID), p.Missing))
+			}
+			fmt.Printf("  %-23s %8.3fs  %-26s %s\n", ts.Stamp(b.Start), b.DurationSeconds,
+				strings.Join(fr, " "), strings.Join(pk, " "))
+		}
+	}
+
+	var onboard []string
+	for _, a := range st.APIDs {
+		if a.OnboardGaps > 0 {
+			onboard = append(onboard, fmt.Sprintf("0x%03X: %d packet(s) in %d gap(s)", uint16(a.APID), a.OnboardMissing, a.OnboardGaps))
+		}
+	}
+	if len(onboard) > 0 {
+		fmt.Println("\nPackets missing while their VC lost no frames (likely lost before downlink):")
+		for _, o := range onboard {
+			fmt.Println("  " + o)
 		}
 	}
 }

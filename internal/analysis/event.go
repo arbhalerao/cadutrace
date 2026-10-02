@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"sync"
+	"time"
 
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 )
@@ -75,6 +76,7 @@ type Event struct {
 	SCID     ccsdsdefs.SCID
 	VCID     ccsdsdefs.VCID
 	APID     ccsdsdefs.APID
+	Time     time.Time // packet time when the event was seen, zero if unknown
 	Message  string
 }
 
