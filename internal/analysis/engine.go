@@ -132,7 +132,7 @@ func NewEngine(cfg Config) *Engine {
 func (e *Engine) ObserveDecodeError(offset int64) {
 	e.decodeErrors++
 	e.bus.Publish(Event{Type: EvDecodeError, Message: "frame decode failed"})
-	e.log.Warn("frame decode error", "offset", offset)
+	e.log.Debug("frame decode error", "offset", offset)
 }
 
 // ObserveCRCFailure records a frame dropped because its FECF did not match
@@ -252,7 +252,7 @@ func (e *Engine) ObservePacket(p *model.SpacePacket) {
 		e.missing += uint64(miss)
 		e.bus.Publish(Event{Type: EvPacketGap, SCID: p.SCID, VCID: p.VCID, APID: p.APID,
 			Message: subject(p.SCID, p.VCID, p.APID, true) + " sequence gap"})
-		e.log.Warn("packet sequence gap", "apid", uint16(p.APID), "missing", miss, "seq", p.SeqCount)
+		e.log.Debug("packet sequence gap", "apid", uint16(p.APID), "missing", miss, "seq", p.SeqCount)
 	case gap.Duplicate:
 		a.duplicates++
 		e.duplicates++
