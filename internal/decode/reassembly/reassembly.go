@@ -96,8 +96,13 @@ func (r *Reassembler) emit(sp model.SpacePacket) {
 
 // Push consumes one VC data field and returns the packets it completed
 // hasFHP is false for B_PDU/VCA data, from which no packets are extracted
-func (r *Reassembler) Push(vc *model.VirtualChannel, data []byte, fhp uint16, hasFHP bool) []*model.SpacePacket {
+// lost reports that frames were missing on this VC since the previous Push, so an
+// open packet is truncated rather than spliced onto unrelated bytes
+func (r *Reassembler) Push(vc *model.VirtualChannel, data []byte, fhp uint16, hasFHP, lost bool) []*model.SpacePacket {
 	r.begin(len(data))
+	if lost && vc.Reasm.Open {
+		r.emitTruncated(vc)
+	}
 	if !hasFHP {
 		return r.scratch
 	}

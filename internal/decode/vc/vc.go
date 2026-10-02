@@ -47,11 +47,13 @@ func (m *Manager) Route(f decode.TransferFrame) (*model.VirtualChannel, []*model
 	vc.FrameCount++
 
 	cnt, mod := f.VCCount(), f.VCCountModulus()
+	lost := false
 	if vc.HasLast {
 		expected := (vc.LastVCFrameCount + 1) % mod
 		missing := int64(cnt) - int64(expected)
 		missing = (missing%int64(mod) + int64(mod)) % int64(mod)
 		if missing != 0 {
+			lost = true
 			vc.FrameGaps++
 			vc.FramesLost += uint64(missing)
 		}
@@ -66,7 +68,7 @@ func (m *Manager) Route(f decode.TransferFrame) (*model.VirtualChannel, []*model
 
 	data := f.Data()
 	vc.DataBytes += uint64(len(data))
-	pkts := m.reasm.Push(vc, data, fhp, hasFHP)
+	pkts := m.reasm.Push(vc, data, fhp, hasFHP, lost)
 	vc.PacketsExtracted += uint64(len(pkts))
 	return vc, pkts, nil
 }
