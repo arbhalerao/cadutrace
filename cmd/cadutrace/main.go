@@ -436,8 +436,12 @@ func printReport(r *app.Result, elapsed time.Duration) {
 	fmt.Println("Virtual channels:")
 	fmt.Printf("  %-4s %-4s %-4s %8s %6s %6s %6s %6s %10s\n", "SCID", "VCID", "TYPE", "FRAMES", "GAPS", "LOST", "IDLE", "PKTS", "BYTES")
 	for _, v := range st.VCs {
-		fmt.Printf("  %-4d %-4d %-4s %8d %6d %6d %6d %6d %10d\n",
-			v.SCID, v.VCID, v.TFVN, v.Frames, v.FrameGaps, v.FramesLost, v.IdleFrames, v.Packets, v.DataBytes)
+		lost := strconv.FormatUint(v.FramesLost, 10)
+		if v.FramesLostEstimate != v.FramesLost {
+			lost = "~" + strconv.FormatUint(v.FramesLostEstimate, 10)
+		}
+		fmt.Printf("  %-4d %-4d %-4s %8d %6d %6s %6d %6d %10d\n",
+			v.SCID, v.VCID, v.TFVN, v.Frames, v.FrameGaps, lost, v.IdleFrames, v.Packets, v.DataBytes)
 	}
 
 	fmt.Println("\nAPIDs:")
@@ -546,7 +550,11 @@ func printLoss(st analysis.Statistics) {
 		for _, b := range shown {
 			var fr, pk []string
 			for _, f := range b.Frames {
-				fr = append(fr, fmt.Sprintf("VC%d:%d", f.VCID, f.Frames))
+				mark := ""
+				if f.Estimated {
+					mark = "~"
+				}
+				fr = append(fr, fmt.Sprintf("VC%d:%s%d", f.VCID, mark, f.Frames))
 			}
 			for _, p := range b.Packets {
 				pk = append(pk, fmt.Sprintf("0x%03X:%d", uint16(p.APID), p.Missing))

@@ -23,6 +23,7 @@ Any flag you pass is used as given, and the report shows what was detected.
 Frames that fail their FECF, or whose channel looks like a one-off false decode, are dropped and counted in the Quality section.
 Packet time is read from the packet secondary header: the CCSDS CUC or CDS time code, its position and its epoch are detected, or set with `--time` and `--epoch`.
 With time, the report places every frame loss in a time span, merges simultaneous losses across VCs into bursts, and separates packets missing while their VC lost no frames (likely lost before downlink).
+A loss longer than the frame counter can count (256 frames on a TM virtual channel) is estimated from the VC's frame rate and marked with `~`.
 
 Flags (✓ = available for that command):
 

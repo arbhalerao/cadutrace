@@ -171,8 +171,9 @@ func (e *Engine) publish(ev Event) {
 }
 
 // ObserveFrameGap records frames missing on a VC just before the current frame
-func (e *Engine) ObserveFrameGap(scid ccsdsdefs.SCID, vcid ccsdsdefs.VCID, lost uint64) {
-	e.tl.frameGap(vcKey{scid, vcid}, lost)
+// modulus is the VC frame counter's wrap modulus
+func (e *Engine) ObserveFrameGap(scid ccsdsdefs.SCID, vcid ccsdsdefs.VCID, lost, modulus uint64) {
+	e.tl.frameGap(vcKey{scid, vcid}, lost, modulus)
 	e.publish(Event{Type: EvFrameGap, SCID: scid, VCID: vcid,
 		Message: subject(scid, vcid, 0, false) + " lost " + strconv.FormatUint(lost, 10) + " frame(s)"})
 }
@@ -227,7 +228,7 @@ func (e *Engine) ObservePacket(p *model.SpacePacket) {
 	}
 
 	k := vcKey{p.SCID, p.VCID}
-	p.Time = e.tl.observe(k, p.Time)
+	p.Time = e.tl.observe(k, p.Time, !p.Truncated)
 
 	e.packets++
 	total := p.TotalLen()
@@ -397,7 +398,6 @@ func (e *Engine) Snapshot(vcs []*model.VirtualChannel) Statistics {
 	s.Quality = e.quality(s)
 	s.Time = e.tl.stats()
 	s.Gaps = append([]Gap(nil), e.tl.gaps...)
-	s.Bursts = bursts(s.Gaps)
 
 	for id, a := range e.encap {
 		s.Encapsulation = append(s.Encapsulation, EncapStats{
@@ -443,6 +443,12 @@ func (e *Engine) Snapshot(vcs []*model.VirtualChannel) Statistics {
 		}
 		return s.VCs[i].VCID < s.VCs[j].VCID
 	})
+
+	if n := correctWraps(s.Gaps, s.VCs, s.Time); n > 0 {
+		s.Quality.Warnings = append(s.Quality.Warnings, fmt.Sprintf(
+			"%d loss(es) outlasted the frame counter's range; their frame counts are estimated from the VC frame rate", n))
+	}
+	s.Bursts = bursts(s.Gaps)
 
 	// CLCW per VC, in the same sorted VC order
 	for _, v := range s.VCs {

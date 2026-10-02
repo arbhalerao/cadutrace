@@ -224,7 +224,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			return nil, rerr
 		}
 		if ch.LastLost > 0 {
-			engine.ObserveFrameGap(ch.SCID, ch.VCID, ch.LastLost)
+			engine.ObserveFrameGap(ch.SCID, ch.VCID, ch.LastLost, uint64(f.VCCountModulus()))
 		}
 		for _, p := range pkts { // consumed before the next Route (reused arena)
 			record(p)

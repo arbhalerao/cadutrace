@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"math"
 	"sort"
 	"time"
 
@@ -66,7 +67,9 @@ func newTimeline() timeline {
 }
 
 // observe vets a packet time, returning the zero time when it is rejected
-func (tl *timeline) observe(k vcKey, t time.Time) time.Time {
+// closes is false for a packet whose time predates any loss it reveals (one cut
+// short by the loss), so it must not end a pending gap
+func (tl *timeline) observe(k vcKey, t time.Time, closes bool) time.Time {
 	if t.IsZero() {
 		return t
 	}
@@ -89,6 +92,9 @@ func (tl *timeline) observe(k vcKey, t time.Time) time.Time {
 	if t.After(tl.now) {
 		tl.now = t
 	}
+	if !closes {
+		return t
+	}
 	for _, i := range tl.pendVC[k] {
 		tl.gaps[i].End = t
 	}
@@ -110,9 +116,9 @@ func (tl *timeline) add(g Gap) int {
 	return len(tl.gaps) - 1
 }
 
-func (tl *timeline) frameGap(k vcKey, lost uint64) Gap {
+func (tl *timeline) frameGap(k vcKey, lost, modulus uint64) Gap {
 	tl.lossEpoch[k]++
-	g := Gap{Kind: "frames", SCID: k.scid, VCID: k.vcid, Missing: lost}
+	g := Gap{Kind: "frames", SCID: k.scid, VCID: k.vcid, Missing: lost, modulus: modulus}
 	c := tl.clocks[k]
 	timedVC := c != nil && c.ok
 	if timedVC {
@@ -145,6 +151,85 @@ func (tl *timeline) stats() TimeStats {
 	return ts
 }
 
+// correctWraps revisits frame losses whose duration implies more frames than the
+// VC counter showed: a loss longer than the counter's modulus wraps it, so the
+// counted value is only known modulo that. The VC's frame rate while receiving
+// gives the expected loss, and the counted value plus the nearest whole number
+// of wraps is taken. Gaps on a VC whose spans overlap (a VC without its own time
+// borrows it from others) are judged together. It returns how many were corrected
+func correctWraps(gaps []Gap, vcs []VCStats, ts TimeStats) int {
+	idx := map[vcKey]int{}
+	for i, v := range vcs {
+		idx[vcKey{v.SCID, v.VCID}] = i
+		vcs[i].FramesLostEstimate = v.FramesLost
+	}
+	total := ts.End.Sub(ts.Start).Seconds()
+	if total <= 0 {
+		return 0
+	}
+
+	type cluster struct {
+		start, end time.Time
+		members    []int
+	}
+	byVC := map[vcKey][]cluster{}
+	for i, g := range gaps {
+		if g.Kind != "frames" || g.modulus == 0 || g.Start.IsZero() || g.End.IsZero() {
+			continue
+		}
+		k := vcKey{g.SCID, g.VCID}
+		cs := byVC[k]
+		if n := len(cs); n > 0 && !g.Start.After(cs[n-1].end) {
+			c := &cs[n-1]
+			c.members = append(c.members, i)
+			if g.End.After(c.end) {
+				c.end = g.End
+			}
+			continue
+		}
+		byVC[k] = append(cs, cluster{start: g.Start, end: g.End, members: []int{i}})
+	}
+
+	fixed := 0
+	for k, cs := range byVC {
+		vi, ok := idx[k]
+		if !ok {
+			continue
+		}
+		dark := 0.0
+		for _, c := range cs {
+			dark += c.end.Sub(c.start).Seconds()
+		}
+		active := total - dark
+		if active <= 0 {
+			continue
+		}
+		rate := float64(vcs[vi].Frames) / active
+		for _, c := range cs {
+			var counted uint64
+			widest := c.members[0]
+			for _, i := range c.members {
+				counted += gaps[i].Missing
+				if gaps[i].End.Sub(gaps[i].Start) > gaps[widest].End.Sub(gaps[widest].Start) {
+					widest = i
+				}
+			}
+			mod := gaps[widest].modulus
+			extra := rate*c.end.Sub(c.start).Seconds() - float64(counted)
+			if extra < float64(mod)/2 {
+				continue
+			}
+			wraps := uint64(math.Round(extra / float64(mod)))
+			g := &gaps[widest]
+			g.Counted = g.Missing
+			g.Missing += wraps * mod
+			vcs[vi].FramesLostEstimate += wraps * mod
+			fixed++
+		}
+	}
+	return fixed
+}
+
 // bursts merges frame gaps whose time spans overlap, across VCs, and attributes
 // to each the packet gaps that fall inside it
 func bursts(gaps []Gap) []Burst {
@@ -175,6 +260,7 @@ func bursts(gaps []Gap) []Burst {
 			b.Frames = append(b.Frames, VCLoss{SCID: g.SCID, VCID: g.VCID})
 		}
 		b.Frames[i].Frames += g.Missing
+		b.Frames[i].Estimated = b.Frames[i].Estimated || g.Counted > 0
 	}
 
 	for _, g := range gaps {

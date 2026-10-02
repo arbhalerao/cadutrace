@@ -219,3 +219,30 @@ func TestOnboardLossIsClassified(t *testing.T) {
 		t.Fatalf("unexpected loss bursts %+v", st.Bursts)
 	}
 }
+
+func TestLongLossOutlastsFrameCounter(t *testing.T) {
+	cfg := timedConfig(0)
+	for i := range cfg.VCs {
+		cfg.VCs[i].NumPackets = 4000
+	}
+	data, man, err := testgen.Build(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const perVC = 300 // more than the 8-bit TM counter can count
+	cut := 3 * perVC * man.CADULen
+	from := 3000 * man.CADULen
+	data = append(data[:from:from], data[from+cut:]...)
+
+	st := run(t, data).Statistics
+	for _, v := range st.VCs {
+		if v.FramesLost != perVC%256 || v.FramesLostEstimate != perVC {
+			t.Errorf("VC %d: lost %d, estimate %d, want %d and %d", v.VCID, v.FramesLost, v.FramesLostEstimate, perVC%256, perVC)
+		}
+	}
+	for _, g := range st.Gaps {
+		if g.Kind == "frames" && (g.Counted != perVC%256 || g.Missing != perVC) {
+			t.Errorf("gap %+v, want counted %d missing %d", g, perVC%256, perVC)
+		}
+	}
+}

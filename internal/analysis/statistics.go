@@ -55,16 +55,21 @@ func (ts TimeStats) Stamp(t time.Time) string {
 // Gap is one loss: frames missing on a VC, or packets missing from an APID
 // Onboard marks packets missing although their VC lost no frames in between,
 // i.e. lost before the downlink. Start and End bound the loss in packet time
+// Counted is set when the frame counter wrapped during the loss: it holds the
+// counter's difference, and Missing an estimate from the VC's frame rate
 type Gap struct {
 	Kind    string         `json:"kind"`
 	SCID    ccsdsdefs.SCID `json:"scid"`
 	VCID    ccsdsdefs.VCID `json:"vcid"`
 	APID    ccsdsdefs.APID `json:"apid"`
 	Missing uint64         `json:"missing"`
+	Counted uint64         `json:"counted,omitempty"`
 	Onboard bool           `json:"onboard,omitempty"`
 	Start   time.Time      `json:"start,omitzero"`
 	End     time.Time      `json:"end,omitzero"`
 	Offset  int64          `json:"offset"`
+
+	modulus uint64
 }
 
 // Burst is a span of time over which frames were lost, merged across VCs
@@ -77,9 +82,10 @@ type Burst struct {
 }
 
 type VCLoss struct {
-	SCID   ccsdsdefs.SCID `json:"scid"`
-	VCID   ccsdsdefs.VCID `json:"vcid"`
-	Frames uint64         `json:"frames"`
+	SCID      ccsdsdefs.SCID `json:"scid"`
+	VCID      ccsdsdefs.VCID `json:"vcid"`
+	Frames    uint64         `json:"frames"`
+	Estimated bool           `json:"estimated,omitempty"`
 }
 
 type APIDLoss struct {
@@ -180,9 +186,11 @@ type VCStats struct {
 	Frames     uint64         `json:"frames"`
 	FrameGaps  uint64         `json:"frame_gaps"`
 	FramesLost uint64         `json:"frames_lost"`
-	IdleFrames uint64         `json:"idle_frames"`
-	Packets    uint64         `json:"packets"`
-	DataBytes  uint64         `json:"data_bytes"`
+	// FramesLostEstimate corrects FramesLost for counter wraps during long losses
+	FramesLostEstimate uint64 `json:"frames_lost_estimate"`
+	IdleFrames         uint64 `json:"idle_frames"`
+	Packets            uint64 `json:"packets"`
+	DataBytes          uint64 `json:"data_bytes"`
 }
 
 // EventCount summarizes how many events of a given type occurred
