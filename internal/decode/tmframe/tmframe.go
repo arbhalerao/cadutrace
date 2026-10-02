@@ -3,6 +3,7 @@ package tmframe
 import (
 	"fmt"
 
+	"github.com/arbhalerao/cadutrace/internal/decode/fecf"
 	"github.com/arbhalerao/cadutrace/internal/model"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 )
@@ -67,6 +68,9 @@ func ParseInto(f *model.TMFrame, raw []byte, cfg Config) error {
 	if cfg.HasFECF {
 		if end-2 < dataStart {
 			return fmt.Errorf("tmframe: FECF overruns frame")
+		}
+		if !fecf.Valid(raw) {
+			return fecf.ErrMismatch
 		}
 		end -= 2
 		f.HasFECF = true

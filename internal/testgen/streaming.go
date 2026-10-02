@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/arbhalerao/cadutrace/internal/decode/randomizer"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 )
 
@@ -126,9 +125,7 @@ func WriteStream(w io.Writer, cfg StreamConfig, targetBytes int64, dropEveryN in
 			if drop {
 				continue // generated but "lost" in transit
 			}
-			if cfg.Randomize {
-				randomizer.Apply(frame) // the ASM is written separately, unrandomized
-			}
+			frame = finish(frame, cfg)
 			if _, err := bw.Write(asmBytes[:]); err != nil {
 				return err
 			}

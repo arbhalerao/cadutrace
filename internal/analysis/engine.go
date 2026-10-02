@@ -1,8 +1,10 @@
 package analysis
 
 import (
+	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 
@@ -39,6 +41,8 @@ type Engine struct {
 
 	frames, tmFrames, aosFrames, idleFrames uint64
 	decodeErrors, caduBytes                 uint64
+	crcFailures                             uint64
+	suspect                                 map[vcKey]*suspectAccum
 
 	packets, idlePackets, truncated, malformed, packetBytes uint64
 	seqGaps, missing, duplicates, reorders                  uint64
@@ -46,6 +50,7 @@ type Engine struct {
 	encapPackets, encapBytes uint64 // Encapsulation Packets, tracked apart from Space Packets
 
 	apids  map[ccsdsdefs.APID]*apidAccum
+	seqs   map[seqKey]*gap.Tracker
 	encap  map[uint8]*encapAccum
 	seenVC map[vcKey]bool
 	clcw   map[vcKey]*clcwAccum
@@ -59,6 +64,18 @@ type Engine struct {
 type vcKey struct {
 	scid ccsdsdefs.SCID
 	vcid ccsdsdefs.VCID
+}
+
+// seqKey scopes sequence tracking to one APID on one VC, so a stream copied onto a
+// second VC (e.g. realtime and playback) is checked as its own stream
+type seqKey struct {
+	vc   vcKey
+	apid ccsdsdefs.APID
+}
+
+type suspectAccum struct {
+	tfvn   ccsdsdefs.TFVN
+	frames uint64
 }
 
 type clcwAccum struct {
@@ -75,7 +92,7 @@ type apidAccum struct {
 	count, bytes      uint64
 	minLen, maxLen    int
 	sumLen            uint64
-	seq               *gap.Tracker
+	vcs               map[ccsdsdefs.VCID]bool
 	seqGaps, missing  uint64
 	duplicates, reord uint64
 	lastSeq           uint16
@@ -84,13 +101,15 @@ type apidAccum struct {
 // NewEngine builds an engine from cfg, filling in defaults
 func NewEngine(cfg Config) *Engine {
 	e := &Engine{
-		log:    cfg.Logger,
-		bus:    cfg.Bus,
-		window: cfg.SeqWindow,
-		apids:  make(map[ccsdsdefs.APID]*apidAccum),
-		encap:  make(map[uint8]*encapAccum),
-		seenVC: make(map[vcKey]bool),
-		clcw:   make(map[vcKey]*clcwAccum),
+		log:     cfg.Logger,
+		bus:     cfg.Bus,
+		window:  cfg.SeqWindow,
+		apids:   make(map[ccsdsdefs.APID]*apidAccum),
+		seqs:    make(map[seqKey]*gap.Tracker),
+		encap:   make(map[uint8]*encapAccum),
+		seenVC:  make(map[vcKey]bool),
+		suspect: make(map[vcKey]*suspectAccum),
+		clcw:    make(map[vcKey]*clcwAccum),
 	}
 	if e.log == nil {
 		e.log = obs.Discard()
@@ -114,6 +133,25 @@ func (e *Engine) ObserveDecodeError(offset int64) {
 	e.decodeErrors++
 	e.bus.Publish(Event{Type: EvDecodeError, Message: "frame decode failed"})
 	e.log.Warn("frame decode error", "offset", offset)
+}
+
+// ObserveCRCFailure records a frame dropped because its FECF did not match
+func (e *Engine) ObserveCRCFailure(offset int64) {
+	e.crcFailures++
+	e.bus.Publish(Event{Type: EvCRCFailure, Message: "frame failed CRC at offset " + strconv.FormatInt(offset, 10)})
+}
+
+// ObserveSuspect records a frame dropped because its channel looks like a false decode
+func (e *Engine) ObserveSuspect(tfvn ccsdsdefs.TFVN, scid ccsdsdefs.SCID, vcid ccsdsdefs.VCID) {
+	k := vcKey{scid, vcid}
+	a := e.suspect[k]
+	if a == nil {
+		a = &suspectAccum{tfvn: tfvn}
+		e.suspect[k] = a
+	}
+	a.frames++
+	e.bus.Publish(Event{Type: EvSuspectFrame, SCID: scid, VCID: vcid,
+		Message: tfvn.String() + " " + subject(scid, vcid, 0, false) + " frame dropped as a likely false decode"})
 }
 
 // ObserveFrame records a decoded transfer frame; caduLen is the CADU stride for
@@ -179,6 +217,7 @@ func (e *Engine) ObservePacket(p *model.SpacePacket) {
 	}
 	a.sumLen += uint64(total)
 	a.lastSeq = p.SeqCount
+	a.vcs[p.VCID] = true
 
 	if p.IsIdle() {
 		e.idlePackets++
@@ -198,7 +237,13 @@ func (e *Engine) ObservePacket(p *model.SpacePacket) {
 	if p.IsIdle() {
 		return
 	}
-	out, miss := a.seq.Observe(int(p.SeqCount))
+	sk := seqKey{vcKey{p.SCID, p.VCID}, p.APID}
+	tr := e.seqs[sk]
+	if tr == nil {
+		tr = gap.New(packetSeqModulus, e.window)
+		e.seqs[sk] = tr
+	}
+	out, miss := tr.Observe(int(p.SeqCount))
 	switch out {
 	case gap.Gap:
 		a.seqGaps++
@@ -284,7 +329,7 @@ func (e *Engine) apidFor(apid ccsdsdefs.APID) *apidAccum {
 	if a, ok := e.apids[apid]; ok {
 		return a
 	}
-	a := &apidAccum{apid: apid, seq: gap.New(packetSeqModulus, e.window)}
+	a := &apidAccum{apid: apid, vcs: make(map[ccsdsdefs.VCID]bool)}
 	e.apids[apid] = a
 	e.bus.Publish(Event{Type: EvNewAPID, APID: apid,
 		Message: subject(0, 0, apid, true) + " first seen"})
@@ -306,6 +351,8 @@ func (e *Engine) Snapshot(vcs []*model.VirtualChannel) Statistics {
 		},
 	}
 
+	s.Quality = e.quality(s)
+
 	for id, a := range e.encap {
 		s.Encapsulation = append(s.Encapsulation, EncapStats{
 			ProtocolID: id, Protocol: encap.ProtocolName(id), Count: a.count, Bytes: a.bytes,
@@ -321,8 +368,13 @@ func (e *Engine) Snapshot(vcs []*model.VirtualChannel) Statistics {
 		if a.count > 0 {
 			mean = round2(float64(a.sumLen) / float64(a.count))
 		}
+		vcs := make([]ccsdsdefs.VCID, 0, len(a.vcs))
+		for v := range a.vcs {
+			vcs = append(vcs, v)
+		}
+		slices.Sort(vcs)
 		s.APIDs = append(s.APIDs, APIDStats{
-			APID: a.apid, Idle: a.apid.IsIdle(), Count: a.count, Bytes: a.bytes,
+			APID: a.apid, VCIDs: vcs, Idle: a.apid.IsIdle(), Count: a.count, Bytes: a.bytes,
 			MinLength: a.minLen, MaxLength: a.maxLen, MeanLength: mean,
 			SequenceGaps: a.seqGaps, MissingPackets: a.missing,
 			Duplicates: a.duplicates, Reorders: a.reord, LastSeqCount: a.lastSeq,
@@ -370,6 +422,47 @@ func (e *Engine) Snapshot(vcs []*model.VirtualChannel) Statistics {
 		s.CFDP = e.cfdp.Snapshot()
 	}
 	return s
+}
+
+func (e *Engine) quality(s Statistics) Quality {
+	q := Quality{
+		FramesUsed: e.frames, CRCFailures: e.crcFailures, DecodeErrors: e.decodeErrors,
+	}
+	for k, a := range e.suspect {
+		q.SuspectFrames += a.frames
+		q.Suspect = append(q.Suspect, SuspectChannel{TFVN: a.tfvn.String(), SCID: k.scid, VCID: k.vcid, Frames: a.frames})
+	}
+	sort.Slice(q.Suspect, func(i, j int) bool {
+		if q.Suspect[i].SCID != q.Suspect[j].SCID {
+			return q.Suspect[i].SCID < q.Suspect[j].SCID
+		}
+		return q.Suspect[i].VCID < q.Suspect[j].VCID
+	})
+	q.FramesRead = q.FramesUsed + q.CRCFailures + q.DecodeErrors + q.SuspectFrames
+
+	frac := func(n, d uint64) float64 {
+		if d == 0 {
+			return 0
+		}
+		return float64(n) / float64(d)
+	}
+	warn := func(format string, a ...any) { q.Warnings = append(q.Warnings, fmt.Sprintf(format, a...)) }
+	const hint = "frame settings may be wrong or the capture has uncorrected errors"
+	if r := frac(q.CRCFailures, q.FramesRead); r > 0.05 {
+		warn("%.1f%% of frames failed CRC: %s", 100*r, hint)
+	}
+	if r := frac(q.DecodeErrors+q.SuspectFrames, q.FramesRead); r > 0.01 {
+		warn("%.1f%% of frames have invalid or unexpected headers: %s", 100*r, hint)
+	}
+	if s.Packets.Total >= 100 {
+		if r := frac(s.Packets.Truncated, s.Packets.Total); r > 0.05 {
+			warn("%.1f%% of packets are truncated: %s", 100*r, hint)
+		}
+		if r := frac(s.Packets.Reorders+s.Packets.Duplicates, s.Packets.Total); r > 0.01 {
+			warn("%.1f%% of packets are out of order or repeated: %s", 100*r, hint)
+		}
+	}
+	return q
 }
 
 func round2(x float64) float64 { return math.Round(x*100) / 100 }

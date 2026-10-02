@@ -14,6 +14,7 @@ import (
 type Config struct {
 	CADULen     int    // total CADU length in octets; 0 = infer from first two ASMs
 	ASM         uint32 // 4-octet sync marker; 0 selects ASMStandard
+	NoASM       bool   // frames are stored back to back without sync markers; CADULen is required
 	RSLen       int    // trailing Reed-Solomon check symbols to skip per frame
 	MaxSearch   int    // max octets to scan for the initial lock; 0 = whole buffer
 	Derandomize bool   // XOR each frame with the CCSDS 131.0 pseudo-randomizer
@@ -32,6 +33,7 @@ type Framer struct {
 	data        []byte
 	asm         [asmLen]byte
 	cadu        int
+	syncLen     int
 	frameLen    int
 	rsLen       int
 	pos         int
@@ -44,8 +46,21 @@ func New(data []byte, cfg Config) (*Framer, error) {
 	if asmVal == 0 {
 		asmVal = ccsdsdefs.ASMStandard
 	}
-	f := &Framer{data: data, rsLen: cfg.RSLen, derandomize: cfg.Derandomize}
+	f := &Framer{data: data, rsLen: cfg.RSLen, derandomize: cfg.Derandomize, syncLen: asmLen}
 	binary.BigEndian.PutUint32(f.asm[:], asmVal)
+
+	if cfg.NoASM {
+		if cfg.CADULen <= 0 {
+			return nil, errors.New("framing: frame length is required without sync markers")
+		}
+		f.syncLen = 0
+		f.cadu = cfg.CADULen
+		f.frameLen = f.cadu - f.rsLen
+		if f.frameLen <= 0 {
+			return nil, fmt.Errorf("framing: non-positive frame length (cadu=%d, rs=%d)", f.cadu, f.rsLen)
+		}
+		return f, nil
+	}
 
 	searchLimit := len(data)
 	if cfg.MaxSearch > 0 && cfg.MaxSearch < searchLimit {
@@ -90,11 +105,26 @@ func (f *Framer) CADULen() int  { return f.cadu }
 // Next returns the next transfer frame, or io.EOF when the stream is exhausted
 // On a sync mismatch it searches forward to re-lock
 func (f *Framer) Next() (RawFrame, error) {
+	rf, err := f.NextRaw()
+	if err != nil || !f.derandomize {
+		return rf, err
+	}
+	// own a copy so the read-only source (e.g. mmap) is never mutated and the
+	// derandomized bytes outlive this call for downstream zero-copy
+	owned := make([]byte, len(rf.Data))
+	copy(owned, rf.Data)
+	randomizer.Apply(owned)
+	rf.Data = owned
+	return rf, nil
+}
+
+// NextRaw is Next without derandomization, returning a slice of the source
+func (f *Framer) NextRaw() (RawFrame, error) {
 	for {
 		if f.pos+f.cadu > len(f.data) {
 			return RawFrame{}, io.EOF
 		}
-		if !(f.data[f.pos] == f.asm[0] && f.data[f.pos+1] == f.asm[1] &&
+		if f.syncLen > 0 && !(f.data[f.pos] == f.asm[0] && f.data[f.pos+1] == f.asm[1] &&
 			f.data[f.pos+2] == f.asm[2] && f.data[f.pos+3] == f.asm[3]) {
 			next := f.findASM(f.pos+1, len(f.data))
 			if next < 0 {
@@ -103,17 +133,8 @@ func (f *Framer) Next() (RawFrame, error) {
 			f.pos = next
 			continue
 		}
-		start := f.pos + asmLen
-		data := f.data[start : start+f.frameLen]
-		if f.derandomize {
-			// own a copy so the read-only source (e.g. mmap) is never mutated and
-			// the derandomized bytes outlive this call for downstream zero-copy
-			owned := make([]byte, f.frameLen)
-			copy(owned, data)
-			randomizer.Apply(owned)
-			data = owned
-		}
-		rf := RawFrame{Data: data, Offset: int64(f.pos)}
+		start := f.pos + f.syncLen
+		rf := RawFrame{Data: f.data[start : start+f.frameLen], Offset: int64(f.pos)}
 		f.pos += f.cadu
 		return rf, nil
 	}

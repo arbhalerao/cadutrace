@@ -34,6 +34,20 @@ func (m Model) viewStats() string {
 	var lines []string
 	add := func(format string, a ...any) { lines = append(lines, fmt.Sprintf(format, a...)) }
 
+	q := st.Quality
+	add("%s", titleStyle.Render("Quality"))
+	add("  frames read %d  used %d  crc-failed %d  invalid-header %d  suspect %d",
+		q.FramesRead, q.FramesUsed, q.CRCFailures, q.DecodeErrors, q.SuspectFrames)
+	for _, c := range q.Suspect {
+		add("  suspect channel %s SCID %d VC %d: %d frame(s) dropped", c.TFVN, c.SCID, c.VCID, c.Frames)
+	}
+	for _, w := range q.Warnings {
+		add("  WARNING: %s", w)
+	}
+	for _, n := range m.store.Notes {
+		add("  detected %s", n)
+	}
+
 	add("%s", titleStyle.Render("Frames"))
 	add("  total %d  tm %d  aos %d  idle %d  decode-errors %d  bytes %d",
 		st.Frames.Total, st.Frames.TM, st.Frames.AOS, st.Frames.Idle, st.Frames.DecodeErrors, st.Frames.Bytes)
@@ -55,15 +69,19 @@ func (m Model) viewStats() string {
 	}
 
 	add("%s", titleStyle.Render("APIDs"))
-	add("  " + headerStyle.Render(row([]string{"APID", "COUNT", "BYTES", "MIN", "MAX", "MEAN", "GAPS", "DUP", "REORD"},
-		[]int{-7, -8, -9, -5, -5, -7, -5, -5, -5})))
+	add("  " + headerStyle.Render(row([]string{"APID", "VCS", "COUNT", "BYTES", "MIN", "MAX", "MEAN", "GAPS", "DUP", "REORD"},
+		[]int{-7, -6, -8, -9, -5, -5, -7, -5, -5, -5})))
 	for _, a := range st.APIDs {
 		label := fmt.Sprintf("0x%03X", uint16(a.APID))
+		vcs := make([]string, len(a.VCIDs))
+		for i, v := range a.VCIDs {
+			vcs[i] = fmt.Sprintf("%d", v)
+		}
 		add("  " + row([]string{
-			label, fmt.Sprintf("%d", a.Count), fmt.Sprintf("%d", a.Bytes),
+			label, strings.Join(vcs, ","), fmt.Sprintf("%d", a.Count), fmt.Sprintf("%d", a.Bytes),
 			fmt.Sprintf("%d", a.MinLength), fmt.Sprintf("%d", a.MaxLength), fmt.Sprintf("%.1f", a.MeanLength),
 			fmt.Sprintf("%d", a.SequenceGaps), fmt.Sprintf("%d", a.Duplicates), fmt.Sprintf("%d", a.Reorders),
-		}, []int{-7, -8, -9, -5, -5, -7, -5, -5, -5}))
+		}, []int{-7, -6, -8, -9, -5, -5, -7, -5, -5, -5}))
 	}
 
 	if len(st.Encapsulation) > 0 {

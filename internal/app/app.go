@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 
@@ -10,7 +11,9 @@ import (
 	"github.com/arbhalerao/cadutrace/internal/appdecoder"
 	"github.com/arbhalerao/cadutrace/internal/decode"
 	"github.com/arbhalerao/cadutrace/internal/decode/encap"
+	"github.com/arbhalerao/cadutrace/internal/decode/fecf"
 	"github.com/arbhalerao/cadutrace/internal/decode/vc"
+	"github.com/arbhalerao/cadutrace/internal/detect"
 	"github.com/arbhalerao/cadutrace/internal/framing"
 	"github.com/arbhalerao/cadutrace/internal/model"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
@@ -27,6 +30,23 @@ type Options struct {
 	Logger         *slog.Logger         // optional; defaults to a discard logger
 	Registry       *appdecoder.Registry // optional; enables application decoding (CFDP)
 	Bus            *analysis.EventBus   // optional; receives analysis events (for the TUI)
+
+	// Detect, when set, infers every setting it does not mark as fixed
+	Detect *detect.Fixed
+	// KeepSuspect keeps frames from channels that look like false decodes
+	KeepSuspect bool
+}
+
+// Settings records the frame settings a run used
+type Settings struct {
+	Sync        string   `json:"sync"`
+	CADULen     int      `json:"cadu_len"`
+	FrameLen    int      `json:"frame_len"`
+	RSLen       int      `json:"rs_len"`
+	Derandomize bool     `json:"derandomize"`
+	TMFECF      bool     `json:"tm_fecf"`
+	AOSFECF     bool     `json:"aos_fecf"`
+	Notes       []string `json:"notes,omitempty"`
 }
 
 // FrameInfo is a renderable summary of one transfer frame
@@ -91,6 +111,7 @@ type Result struct {
 	Bytes         int                 `json:"bytes"`
 	CADULen       int                 `json:"cadu_len"`
 	FrameLen      int                 `json:"frame_len"`
+	Settings      Settings            `json:"settings"`
 	Statistics    analysis.Statistics `json:"statistics"`
 	PacketList    []PacketInfo        `json:"packet_list,omitempty"`
 	FrameList     []FrameInfo         `json:"-"` // populated only when CollectFrames is set
@@ -106,9 +127,22 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	var notes []string
+	if opts.Detect != nil {
+		if notes, err = applyDetection(data, &opts); err != nil {
+			return nil, err
+		}
+	}
+
 	framer, err := framing.New(data, opts.Framing)
 	if err != nil {
 		return nil, err
+	}
+	var trusted map[detect.ChannelID]bool
+	if !opts.KeepSuspect {
+		if trusted, err = detect.Channels(data, opts.Framing); err != nil {
+			return nil, err
+		}
 	}
 	dec := decode.NewFrameDecoder(opts.Frames)
 	mgr := vc.New(opts.MaxPacketLen)
@@ -125,6 +159,11 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		Bytes:         len(data),
 		CADULen:       caduLen,
 		FrameLen:      framer.FrameLen(),
+		Settings: Settings{
+			Sync: syncName(opts.Framing), CADULen: caduLen, FrameLen: framer.FrameLen(),
+			RSLen: opts.Framing.RSLen, Derandomize: opts.Framing.Derandomize,
+			TMFECF: opts.Frames.TM.HasFECF, AOSFECF: opts.Frames.AOS.HasFECF, Notes: notes,
+		},
 	}
 
 	record := func(p *model.SpacePacket) {
@@ -145,7 +184,18 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		if trusted != nil && len(raw.Data) >= 6 {
+			id := detect.ParseChannel(raw.Data).ID()
+			if !trusted[id] {
+				engine.ObserveSuspect(id.TFVN, id.SCID, id.VCID)
+				continue
+			}
+		}
 		f, derr := dec.Decode(raw.Data)
+		if errors.Is(derr, fecf.ErrMismatch) {
+			engine.ObserveCRCFailure(raw.Offset)
+			continue
+		}
 		if derr != nil {
 			engine.ObserveDecodeError(raw.Offset)
 			continue
@@ -176,4 +226,34 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	res.Statistics = engine.Snapshot(mgr.VirtualChannels())
 	return res, nil
+}
+
+func applyDetection(data []byte, opts *Options) ([]string, error) {
+	fx := *opts.Detect
+	in := detect.Params{
+		NoASM: opts.Framing.NoASM, ASM: opts.Framing.ASM, CADULen: opts.Framing.CADULen,
+		RSLen: opts.Framing.RSLen, Derandomize: opts.Framing.Derandomize,
+		FECF: opts.Frames.TM.HasFECF || opts.Frames.AOS.HasFECF,
+	}
+	p, notes, err := detect.Detect(data, in, fx)
+	if err != nil {
+		return notes, err
+	}
+	opts.Framing = p.Framing()
+	if !fx.FECF {
+		opts.Frames.TM.HasFECF = p.FECF && p.TFVN == ccsdsdefs.TFVNTM
+		opts.Frames.AOS.HasFECF = p.FECF && p.TFVN == ccsdsdefs.TFVNAOS
+	}
+	return notes, nil
+}
+
+func syncName(c framing.Config) string {
+	if c.NoASM {
+		return "none"
+	}
+	asm := c.ASM
+	if asm == 0 {
+		asm = ccsdsdefs.ASMStandard
+	}
+	return fmt.Sprintf("%08X", asm)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/arbhalerao/cadutrace/internal/decode"
 	"github.com/arbhalerao/cadutrace/internal/decode/aosframe"
 	"github.com/arbhalerao/cadutrace/internal/decode/tmframe"
+	"github.com/arbhalerao/cadutrace/internal/detect"
 	"github.com/arbhalerao/cadutrace/internal/framing"
 	"github.com/arbhalerao/cadutrace/internal/source"
 	"github.com/arbhalerao/cadutrace/internal/store"
@@ -60,21 +61,98 @@ Run "cadutrace <command> -h" for flags.
 `)
 }
 
+// frameFlags are the capture settings shared by analyze and tui
+type frameFlags struct {
+	fs          *flag.FlagSet
+	caduLen     *int
+	frameLen    *int
+	noASM       *bool
+	rsLen       *int
+	derandomize *bool
+	asmHex      *string
+	maxPkt      *int
+	tmFECF      *bool
+	aosFHEC     *bool
+	aosOCF      *bool
+	aosFECF     *bool
+	aosInsert   *int
+	cfdpAPIDs   *string
+	noDetect    *bool
+	keepSuspect *bool
+}
+
+func addFrameFlags(fs *flag.FlagSet) *frameFlags {
+	return &frameFlags{
+		fs:          fs,
+		caduLen:     fs.Int("cadu-len", 0, "CADU length in octets including sync marker and RS symbols (default: detected)"),
+		frameLen:    fs.Int("frame-len", 0, "transfer frame length in octets (default: detected)"),
+		noASM:       fs.Bool("no-asm", false, "frames are stored back to back without sync markers (default: detected)"),
+		rsLen:       fs.Int("rs-len", 0, "trailing Reed-Solomon check symbols to skip per frame (default: detected via FECF)"),
+		derandomize: fs.Bool("derandomize", false, "undo CCSDS 131.0 pseudo-randomization on each frame (default: detected)"),
+		asmHex:      fs.String("asm", "", "sync marker as hex (default 1ACFFC1D)"),
+		maxPkt:      fs.Int("max-packet-len", 0, "max reassembled packet length (0 = protocol max)"),
+		tmFECF:      fs.Bool("tm-fecf", false, "TM frames carry a Frame Error Control Field (default: detected)"),
+		aosFHEC:     fs.Bool("aos-fhec", false, "AOS frames carry a Frame Header Error Control field"),
+		aosOCF:      fs.Bool("aos-ocf", false, "AOS frames carry an Operational Control Field"),
+		aosFECF:     fs.Bool("aos-fecf", false, "AOS frames carry a Frame Error Control Field (default: detected)"),
+		aosInsert:   fs.Int("aos-insert-zone", 0, "AOS insert zone length in octets"),
+		cfdpAPIDs:   fs.String("cfdp-apid", "", "comma-separated APIDs carrying CFDP (e.g. 0x7E1,2017) to decode and track"),
+		noDetect:    fs.Bool("no-detect", false, "use only the given settings; skip auto-detection"),
+		keepSuspect: fs.Bool("keep-suspect", false, "keep frames from channels that look like false decodes"),
+	}
+}
+
+// settings turns the parsed flags into pipeline options; flags given explicitly
+// are fixed, the rest are left to detection
+func (ff *frameFlags) settings() (framing.Config, decode.Config, *detect.Fixed, error) {
+	set := map[string]bool{}
+	ff.fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	var asm uint32
+	if *ff.asmHex != "" {
+		v, err := strconv.ParseUint(*ff.asmHex, 16, 32)
+		if err != nil {
+			return framing.Config{}, decode.Config{}, nil, fmt.Errorf("invalid --asm: %w", err)
+		}
+		asm = uint32(v)
+	}
+	if set["cadu-len"] && set["frame-len"] {
+		return framing.Config{}, decode.Config{}, nil, fmt.Errorf("--cadu-len and --frame-len are mutually exclusive")
+	}
+	cadu := *ff.caduLen
+	if set["frame-len"] {
+		cadu = *ff.frameLen + *ff.rsLen
+		if !*ff.noASM {
+			cadu += 4
+		}
+	}
+	fc := framing.Config{CADULen: cadu, ASM: asm, NoASM: *ff.noASM, RSLen: *ff.rsLen, Derandomize: *ff.derandomize}
+	dc := decode.Config{
+		TM:  tmframe.Config{HasFECF: *ff.tmFECF},
+		AOS: aosframe.Config{HasFHEC: *ff.aosFHEC, HasOCF: *ff.aosOCF, HasFECF: *ff.aosFECF, InsertZoneLen: *ff.aosInsert},
+	}
+	if *ff.noDetect {
+		return fc, dc, nil, nil
+	}
+	return fc, dc, &detect.Fixed{
+		Sync:        set["no-asm"] || set["asm"],
+		CADULen:     set["cadu-len"] || set["frame-len"],
+		RSLen:       set["rs-len"] || set["frame-len"],
+		Derandomize: set["derandomize"],
+		FECF:        set["tm-fecf"] || set["aos-fecf"],
+	}, nil
+}
+
+func (ff *frameFlags) cfdp() ([]ccsdsdefs.APID, error) {
+	if *ff.cfdpAPIDs == "" {
+		return nil, nil
+	}
+	return parseAPIDList(*ff.cfdpAPIDs)
+}
+
 func runTUI(args []string) error {
 	fs := flag.NewFlagSet("tui", flag.ExitOnError)
-	var (
-		caduLen     = fs.Int("cadu-len", 0, "CADU length in octets (0 = infer from sync markers)")
-		rsLen       = fs.Int("rs-len", 0, "trailing Reed-Solomon check symbols to skip per frame")
-		derandomize = fs.Bool("derandomize", false, "undo CCSDS 131.0 pseudo-randomization on each frame")
-		asmHex      = fs.String("asm", "", "sync marker as hex (default 1ACFFC1D)")
-		maxPkt      = fs.Int("max-packet-len", 0, "max reassembled packet length (0 = protocol max)")
-		tmFECF      = fs.Bool("tm-fecf", false, "TM frames carry a Frame Error Control Field")
-		aosFHEC     = fs.Bool("aos-fhec", false, "AOS frames carry a Frame Header Error Control field")
-		aosOCF      = fs.Bool("aos-ocf", false, "AOS frames carry an Operational Control Field")
-		aosFECF     = fs.Bool("aos-fecf", false, "AOS frames carry a Frame Error Control Field")
-		aosInsert   = fs.Int("aos-insert-zone", 0, "AOS insert zone length in octets")
-		cfdpAPIDs   = fs.String("cfdp-apid", "", "comma-separated APIDs carrying CFDP to decode and track")
-	)
+	ff := addFrameFlags(fs)
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: cadutrace tui [flags] <file.cadu>")
 		fs.PrintDefaults()
@@ -86,21 +164,13 @@ func runTUI(args []string) error {
 		fs.Usage()
 		return fmt.Errorf("expected exactly one input file")
 	}
-
-	var asm uint32
-	if *asmHex != "" {
-		v, err := strconv.ParseUint(*asmHex, 16, 32)
-		if err != nil {
-			return fmt.Errorf("invalid --asm: %w", err)
-		}
-		asm = uint32(v)
+	fc, dc, fixed, err := ff.settings()
+	if err != nil {
+		return err
 	}
-	var apids []ccsdsdefs.APID
-	if *cfdpAPIDs != "" {
-		var err error
-		if apids, err = parseAPIDList(*cfdpAPIDs); err != nil {
-			return err
-		}
+	apids, err := ff.cfdp()
+	if err != nil {
+		return err
 	}
 
 	src, err := source.OpenFile(fs.Arg(0))
@@ -111,14 +181,13 @@ func runTUI(args []string) error {
 
 	fmt.Fprintf(os.Stderr, "loading %s…\n", fs.Arg(0))
 	st, err := store.Load(context.Background(), store.LoadOptions{
-		Source:  src,
-		Framing: framing.Config{CADULen: *caduLen, ASM: asm, RSLen: *rsLen, Derandomize: *derandomize},
-		Frames: decode.Config{
-			TM:  tmframe.Config{HasFECF: *tmFECF},
-			AOS: aosframe.Config{HasFHEC: *aosFHEC, HasOCF: *aosOCF, HasFECF: *aosFECF, InsertZoneLen: *aosInsert},
-		},
-		MaxPacketLen: *maxPkt,
+		Source:       src,
+		Framing:      fc,
+		Frames:       dc,
+		MaxPacketLen: *ff.maxPkt,
 		CFDPAPIDs:    apids,
+		Detect:       fixed,
+		KeepSuspect:  *ff.keepSuspect,
 	})
 	if err != nil {
 		return err
@@ -128,22 +197,12 @@ func runTUI(args []string) error {
 
 func runAnalyze(args []string) error {
 	fs := flag.NewFlagSet("analyze", flag.ExitOnError)
+	ff := addFrameFlags(fs)
 	var (
 		jsonOut     = fs.Bool("json", false, "emit a JSON report instead of a text health report")
 		listPackets = fs.Bool("packets", false, "include the full packet list (with --json)")
-		caduLen     = fs.Int("cadu-len", 0, "CADU length in octets (0 = infer from sync markers)")
-		rsLen       = fs.Int("rs-len", 0, "trailing Reed-Solomon check symbols to skip per frame")
-		derandomize = fs.Bool("derandomize", false, "undo CCSDS 131.0 pseudo-randomization on each frame")
-		asmHex      = fs.String("asm", "", "sync marker as hex (default 1ACFFC1D)")
-		maxPkt      = fs.Int("max-packet-len", 0, "max reassembled packet length (0 = protocol max)")
-		tmFECF      = fs.Bool("tm-fecf", false, "TM frames carry a Frame Error Control Field")
-		aosFHEC     = fs.Bool("aos-fhec", false, "AOS frames carry a Frame Header Error Control field")
-		aosOCF      = fs.Bool("aos-ocf", false, "AOS frames carry an Operational Control Field")
-		aosFECF     = fs.Bool("aos-fecf", false, "AOS frames carry a Frame Error Control Field")
-		aosInsert   = fs.Int("aos-insert-zone", 0, "AOS insert zone length in octets")
 		logLevel    = fs.String("log-level", "info", "log level: debug|info|warn|error")
 		logFormat   = fs.String("log-format", "text", "log format: text|json")
-		cfdpAPIDs   = fs.String("cfdp-apid", "", "comma-separated APIDs carrying CFDP (e.g. 0x7E1,2017) to decode and track")
 		apidFilter  = fs.String("apid", "", "restrict the --packets list to these APIDs (csv, dec or 0x)")
 		vcidFilter  = fs.String("vcid", "", "restrict the --packets list to these VCIDs (csv)")
 	)
@@ -158,24 +217,19 @@ func runAnalyze(args []string) error {
 		fs.Usage()
 		return fmt.Errorf("expected exactly one input file")
 	}
-
-	var asm uint32
-	if *asmHex != "" {
-		v, err := strconv.ParseUint(*asmHex, 16, 32)
-		if err != nil {
-			return fmt.Errorf("invalid --asm: %w", err)
-		}
-		asm = uint32(v)
+	fc, dc, fixed, err := ff.settings()
+	if err != nil {
+		return err
 	}
 
 	logger := obs.NewLogger(os.Stderr, obs.ParseLevel(*logLevel), *logFormat)
 
 	var registry *appdecoder.Registry
-	if *cfdpAPIDs != "" {
-		apids, err := parseAPIDList(*cfdpAPIDs)
-		if err != nil {
-			return err
-		}
+	apids, err := ff.cfdp()
+	if err != nil {
+		return err
+	}
+	if len(apids) > 0 {
 		registry = appdecoder.New()
 		for _, a := range apids {
 			registry.RegisterAPID(a, cfdp.Decoder{})
@@ -189,26 +243,15 @@ func runAnalyze(args []string) error {
 	defer src.Close()
 
 	opts := app.Options{
-		Source: src,
-		Framing: framing.Config{
-			CADULen:     *caduLen,
-			ASM:         asm,
-			RSLen:       *rsLen,
-			Derandomize: *derandomize,
-		},
-		Frames: decode.Config{
-			TM: tmframe.Config{HasFECF: *tmFECF},
-			AOS: aosframe.Config{
-				HasFHEC:       *aosFHEC,
-				HasOCF:        *aosOCF,
-				HasFECF:       *aosFECF,
-				InsertZoneLen: *aosInsert,
-			},
-		},
-		MaxPacketLen:   *maxPkt,
+		Source:         src,
+		Framing:        fc,
+		Frames:         dc,
+		MaxPacketLen:   *ff.maxPkt,
 		CollectPackets: *listPackets,
 		Logger:         logger,
 		Registry:       registry,
+		Detect:         fixed,
+		KeepSuspect:    *ff.keepSuspect,
 	}
 
 	start := time.Now()
@@ -295,6 +338,14 @@ func parseAPIDList(s string) ([]ccsdsdefs.APID, error) {
 	return out, nil
 }
 
+func vcList(vcs []ccsdsdefs.VCID) string {
+	parts := make([]string, len(vcs))
+	for i, v := range vcs {
+		parts[i] = strconv.Itoa(int(v))
+	}
+	return strings.Join(parts, ",")
+}
+
 func yesno(b bool) string {
 	if b {
 		return "yes"
@@ -310,8 +361,25 @@ func printReport(r *app.Result, elapsed time.Duration) {
 	}
 
 	fmt.Printf("Source:   %s (%d bytes)\n", r.Source, r.Bytes)
-	fmt.Printf("CADU len: %d   frame len: %d\n", r.CADULen, r.FrameLen)
+	cfg := r.Settings
+	fmt.Printf("Settings: sync %s  cadu %d  frame %d  rs %d  derandomize %s  fecf %s\n",
+		cfg.Sync, cfg.CADULen, cfg.FrameLen, cfg.RSLen, yesno(cfg.Derandomize), yesno(cfg.TMFECF || cfg.AOSFECF))
+	for _, n := range cfg.Notes {
+		fmt.Printf("  detected %s\n", n)
+	}
 	fmt.Printf("Processed in %s (%.1f MB/s)\n\n", elapsed.Round(time.Microsecond), mbps)
+
+	q := st.Quality
+	fmt.Println("Quality:")
+	fmt.Printf("  frames read %d  used %d  crc-failed %d  invalid-header %d  suspect %d\n",
+		q.FramesRead, q.FramesUsed, q.CRCFailures, q.DecodeErrors, q.SuspectFrames)
+	for _, c := range q.Suspect {
+		fmt.Printf("  suspect channel %s SCID %d VC %d: %d frame(s) dropped as likely false decodes\n", c.TFVN, c.SCID, c.VCID, c.Frames)
+	}
+	for _, w := range q.Warnings {
+		fmt.Printf("  WARNING: %s\n", w)
+	}
+	fmt.Println()
 
 	fmt.Println("Frames:")
 	fmt.Printf("  total %d  tm %d  aos %d  idle %d  decode-errors %d  bytes %d\n\n",
@@ -330,14 +398,14 @@ func printReport(r *app.Result, elapsed time.Duration) {
 	}
 
 	fmt.Println("\nAPIDs:")
-	fmt.Printf("  %-7s %8s %8s %5s %5s %7s %5s %5s %5s\n", "APID", "COUNT", "BYTES", "MIN", "MAX", "MEAN", "GAPS", "DUP", "REORD")
+	fmt.Printf("  %-7s %-6s %8s %9s %5s %5s %7s %5s %5s %5s\n", "APID", "VCS", "COUNT", "BYTES", "MIN", "MAX", "MEAN", "GAPS", "DUP", "REORD")
 	for _, a := range st.APIDs {
 		label := fmt.Sprintf("0x%03X", uint16(a.APID))
 		if a.Idle {
 			label += "*"
 		}
-		fmt.Printf("  %-7s %8d %8d %5d %5d %7.1f %5d %5d %5d\n",
-			label, a.Count, a.Bytes, a.MinLength, a.MaxLength, a.MeanLength, a.SequenceGaps, a.Duplicates, a.Reorders)
+		fmt.Printf("  %-7s %-6s %8d %9d %5d %5d %7.1f %5d %5d %5d\n",
+			label, vcList(a.VCIDs), a.Count, a.Bytes, a.MinLength, a.MaxLength, a.MeanLength, a.SequenceGaps, a.Duplicates, a.Reorders)
 	}
 
 	if len(st.Encapsulation) > 0 {

@@ -8,6 +8,7 @@ import (
 // Statistics is a deterministic snapshot of the engine's state (the JSON report)
 // Content-derived numbers only; the wall-clock rate is printed separately by the CLI
 type Statistics struct {
+	Quality Quality      `json:"quality"`
 	Frames  FrameStats   `json:"frames"`
 	Packets PacketStats  `json:"packets"`
 	APIDs   []APIDStats  `json:"apids"`
@@ -17,6 +18,25 @@ type Statistics struct {
 	Encapsulation []EncapStats                `json:"encapsulation,omitempty"`
 	CLCW          []CLCWStat                  `json:"clcw,omitempty"`
 	CFDP          []cfdptrack.TransactionStat `json:"cfdp,omitempty"`
+}
+
+// Quality summarizes how much of the capture could be trusted
+type Quality struct {
+	FramesRead    uint64           `json:"frames_read"`
+	FramesUsed    uint64           `json:"frames_used"`
+	CRCFailures   uint64           `json:"crc_failures"`
+	DecodeErrors  uint64           `json:"decode_errors"`
+	SuspectFrames uint64           `json:"suspect_frames"`
+	Suspect       []SuspectChannel `json:"suspect_channels,omitempty"`
+	Warnings      []string         `json:"warnings,omitempty"`
+}
+
+// SuspectChannel is a channel whose frames were dropped as likely false decodes
+type SuspectChannel struct {
+	TFVN   string         `json:"tfvn"`
+	SCID   ccsdsdefs.SCID `json:"scid"`
+	VCID   ccsdsdefs.VCID `json:"vcid"`
+	Frames uint64         `json:"frames"`
 }
 
 // EncapStats is per-Protocol-ID statistics for Encapsulation Packets (CCSDS 133.1)
@@ -68,18 +88,19 @@ type PacketStats struct {
 
 // APIDStats is per-Application-Process statistics
 type APIDStats struct {
-	APID           ccsdsdefs.APID `json:"apid"`
-	Idle           bool           `json:"idle"`
-	Count          uint64         `json:"count"`
-	Bytes          uint64         `json:"bytes"`
-	MinLength      int            `json:"min_length"`
-	MaxLength      int            `json:"max_length"`
-	MeanLength     float64        `json:"mean_length"`
-	SequenceGaps   uint64         `json:"sequence_gaps"`
-	MissingPackets uint64         `json:"missing_packets"`
-	Duplicates     uint64         `json:"duplicates"`
-	Reorders       uint64         `json:"reorders"`
-	LastSeqCount   uint16         `json:"last_seq_count"`
+	APID           ccsdsdefs.APID   `json:"apid"`
+	VCIDs          []ccsdsdefs.VCID `json:"vcids"`
+	Idle           bool             `json:"idle"`
+	Count          uint64           `json:"count"`
+	Bytes          uint64           `json:"bytes"`
+	MinLength      int              `json:"min_length"`
+	MaxLength      int              `json:"max_length"`
+	MeanLength     float64          `json:"mean_length"`
+	SequenceGaps   uint64           `json:"sequence_gaps"`
+	MissingPackets uint64           `json:"missing_packets"`
+	Duplicates     uint64           `json:"duplicates"`
+	Reorders       uint64           `json:"reorders"`
+	LastSeqCount   uint16           `json:"last_seq_count"`
 }
 
 // VCStats is per-virtual-channel statistics

@@ -3,6 +3,7 @@ package aosframe
 import (
 	"fmt"
 
+	"github.com/arbhalerao/cadutrace/internal/decode/fecf"
 	"github.com/arbhalerao/cadutrace/internal/model"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 )
@@ -65,6 +66,9 @@ func ParseInto(f *model.AOSFrame, raw []byte, cfg Config) error {
 	if cfg.HasFECF {
 		if end-2 < off {
 			return fmt.Errorf("aosframe: FECF overruns frame")
+		}
+		if !fecf.Valid(raw) {
+			return fecf.ErrMismatch
 		}
 		end -= 2
 	}

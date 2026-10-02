@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/arbhalerao/cadutrace/internal/decode/encap"
+	"github.com/arbhalerao/cadutrace/internal/decode/fecf"
 	"github.com/arbhalerao/cadutrace/internal/decode/randomizer"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 )
@@ -36,6 +37,8 @@ type StreamConfig struct {
 	ASM          uint32 // 0 selects the standard marker
 	OCF          []byte // optional 4-octet OCF (CLCW) appended to every TM frame
 	Randomize    bool   // apply the CCSDS 131.0 pseudo-randomizer to each frame
+	FECF         bool   // append a valid Frame Error Control Field to each frame
+	RSLen        int    // append this many filler octets standing in for Reed-Solomon check symbols
 }
 
 // Manifest is the ground truth a generated stream should decode to
@@ -75,7 +78,10 @@ func Build(cfg StreamConfig) ([]byte, Manifest, error) {
 	if cfg.FrameType != ccsdsdefs.TFVNTM {
 		ocf = nil // OCF injection is only wired for TM frames
 	}
-	caduLen := asmLen + frameTotalLen(cfg.FrameType, cfg.FrameDataLen) + len(ocf)
+	caduLen := asmLen + frameTotalLen(cfg.FrameType, cfg.FrameDataLen) + len(ocf) + cfg.RSLen
+	if cfg.FECF {
+		caduLen += 2
+	}
 	man := Manifest{
 		PacketsPerAPID:   map[ccsdsdefs.APID]int{},
 		EncapPerProtocol: map[uint8]int{},
@@ -152,11 +158,7 @@ func Build(cfg StreamConfig) ([]byte, Manifest, error) {
 			if idx[ci] >= len(frames) {
 				continue
 			}
-			frame := frames[idx[ci]]
-			if cfg.Randomize {
-				frame = append([]byte(nil), frame...)
-				randomizer.Apply(frame) // the ASM is appended separately, unrandomized
-			}
+			frame := finish(frames[idx[ci]], cfg)
 			out = append(out, asmBytes[:]...)
 			out = append(out, frame...)
 			idx[ci]++
@@ -164,6 +166,22 @@ func Build(cfg StreamConfig) ([]byte, Manifest, error) {
 		}
 	}
 	return out, man, nil
+}
+
+// finish returns a copy of frame with the optional FECF, randomization and RS
+// filler applied, in transmit order
+func finish(frame []byte, cfg StreamConfig) []byte {
+	out := append(make([]byte, 0, len(frame)+2+cfg.RSLen), frame...)
+	if cfg.FECF {
+		out = binary.BigEndian.AppendUint16(out, fecf.Sum(out))
+	}
+	if cfg.Randomize {
+		randomizer.Apply(out)
+	}
+	for i := range cfg.RSLen {
+		out = append(out, byte(i*37+11))
+	}
+	return out
 }
 
 func frameTotalLen(t ccsdsdefs.TFVN, dataLen int) int {

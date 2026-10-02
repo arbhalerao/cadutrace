@@ -11,6 +11,7 @@ import (
 	"github.com/arbhalerao/cadutrace/internal/appdecoder/cfdp"
 	"github.com/arbhalerao/cadutrace/internal/decode"
 	"github.com/arbhalerao/cadutrace/internal/decode/spacepacket"
+	"github.com/arbhalerao/cadutrace/internal/detect"
 	"github.com/arbhalerao/cadutrace/internal/framing"
 	"github.com/arbhalerao/cadutrace/pkg/ccsdsdefs"
 	"github.com/arbhalerao/cadutrace/pkg/obs"
@@ -24,6 +25,8 @@ type LoadOptions struct {
 	Frames       decode.Config
 	MaxPacketLen int
 	CFDPAPIDs    []ccsdsdefs.APID
+	Detect       *detect.Fixed
+	KeepSuspect  bool
 }
 
 // Store holds an analyzed capture for random-access navigation
@@ -32,6 +35,7 @@ type Store struct {
 	Bytes    int
 	CADULen  int
 	FrameLen int
+	Notes    []string
 
 	frames   []app.FrameInfo
 	packets  []app.PacketInfo
@@ -62,6 +66,8 @@ func Load(ctx context.Context, opts LoadOptions) (*Store, error) {
 		CollectPackets: true,
 		Registry:       appReg,
 		Bus:            bus,
+		Detect:         opts.Detect,
+		KeepSuspect:    opts.KeepSuspect,
 	})
 	if err != nil {
 		return nil, err
@@ -72,6 +78,7 @@ func Load(ctx context.Context, opts LoadOptions) (*Store, error) {
 		Bytes:    res.Bytes,
 		CADULen:  res.CADULen,
 		FrameLen: res.FrameLen,
+		Notes:    res.Settings.Notes,
 		frames:   res.FrameList,
 		packets:  res.PacketList,
 		stats:    res.Statistics,

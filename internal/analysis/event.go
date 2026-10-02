@@ -33,6 +33,8 @@ type EventType string
 
 const (
 	EvDecodeError     EventType = "decode_error"
+	EvCRCFailure      EventType = "crc_failure"
+	EvSuspectFrame    EventType = "suspect_frame"
 	EvFrameGap        EventType = "frame_gap"
 	EvPacketGap       EventType = "packet_gap"
 	EvPacketDuplicate EventType = "packet_duplicate"
@@ -55,7 +57,7 @@ func severityOf(t EventType) Severity {
 	switch t {
 	case EvDecodeError:
 		return Error
-	case EvFrameGap, EvPacketGap, EvPacketDuplicate, EvPacketReorder, EvTruncated, EvMalformed,
+	case EvCRCFailure, EvSuspectFrame, EvFrameGap, EvPacketGap, EvPacketDuplicate, EvPacketReorder, EvTruncated, EvMalformed,
 		EvCFDPGap, EvCFDPIncomplete, EvCFDPNAK:
 		return Warn
 	default:
